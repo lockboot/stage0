@@ -1,0 +1,47 @@
+# Lean QEMU test-harness runtime for qemu-test.sh: no rust/sbsign/kernel toolchain,
+# just the qemu/swtpm layer needed to boot a disk and mock the metadata service.
+FROM debian:bookworm-slim
+
+RUN apt-get -qq update && \
+    apt-get install -y --no-install-recommends \
+    qemu-system-x86 \
+    qemu-system-arm \
+    ovmf \
+    qemu-efi-aarch64 \
+    swtpm \
+    swtpm-tools \
+    tpm2-tools \
+    xxd \
+    dnsmasq \
+    iproute2 \
+    iptables \
+    python3 \
+    curl \
+    ca-certificates \
+    openssl \
+    tcpdump && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pre-bake the EC2 metadata mock so make/CI runs don't download into the
+# bind-mounted repo. qemu-test.sh checks EC2_MOCK_CACHE (set to /opt by the
+# Makefile) before falling back to its own download.
+ARG AEMM_VERSION=v1.13.0
+ARG AEMM_SHA256=4f89ddc71ac53ce540bda1f9c340526d558eed8e41349761f2798acf1b254950
+RUN curl -fsSL -o /opt/ec2-metadata-mock-linux-amd64 \
+      "https://github.com/aws/amazon-ec2-metadata-mock/releases/download/${AEMM_VERSION}/ec2-metadata-mock-linux-amd64" && \
+    echo "${AEMM_SHA256}  /opt/ec2-metadata-mock-linux-amd64" | sha256sum -c - && \
+    chmod +x /opt/ec2-metadata-mock-linux-amd64
+
+# The mock is baked at /opt; point the entrypoint script at it by default.
+ENV EC2_MOCK_CACHE=/opt
+# This image only ever runs inside a throwaway container, where qemu-test.sh's
+# NAT/iptables setup is safe; bake the acknowledgement so callers don't have to.
+ENV YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1
+
+# Bake the harness script in as the entrypoint so the image is self-contained:
+# `docker run ... lockboot:harness --kind stage0 --boot-disk ...` just works.
+COPY tools/qemu-test.sh /usr/local/bin/qemu-test.sh
+RUN chmod +x /usr/local/bin/qemu-test.sh
+
+WORKDIR /src
+ENTRYPOINT ["/usr/local/bin/qemu-test.sh"]

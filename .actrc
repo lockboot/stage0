@@ -1,0 +1,7 @@
+# Bind-mount the workspace instead of copying it into a volume. Our build runs in
+# a docker-in-docker container (host daemon) that writes into the real host
+# checkout; in act's default copy mode the runner works on a separate volume copy,
+# so build output (build/<arch>/...) never appears where upload-artifact globs.
+# Bind mode makes the runner workspace the same host dir the build writes to, so
+# `gh act` matches real CI (upload-artifact included).
+--bind

@@ -1,0 +1,34 @@
+# Rust / cargo (the build container sets CARGO_HOME=/src/.cargo, RUSTUP_HOME=/src/.rustup)
+target
+.cargo/.global-cache
+.cargo/.package-cache
+.cargo/.package-cache-mutate
+.cargo/git
+.cargo/registry
+.cargo/.crates.toml
+.cargo/.crates2.json
+.cargo/bin/
+.rustup
+
+# Dev-container HOME junk (HOME=/src maps onto this repo root in the build container)
+.bashrc
+.config
+.gitconfig
+.cache
+.local
+.python_history
+.wget-hsts
+.lesshst
+__pycache__
+
+# All build output (per-arch boot disks/payloads, generated snakeoil + release
+# keys) is regenerated, so the whole dir is ignorable. The key-gen source lives
+# in tools/gen-keys.sh.
+build/
+
+# Test artifacts
+user-data.stage0.json
+stage0-trace.*
+
+# qemu-test.sh self-bootstrapped EC2 mock
+tools/ec2-metadata-mock-linux-amd64
