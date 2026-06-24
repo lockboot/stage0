@@ -29,6 +29,11 @@ build/
 # Test artifacts
 user-data.stage0.json
 stage0-trace.*
+test.json
 
 # qemu-test.sh self-bootstrapped EC2 mock
 tools/ec2-metadata-mock-linux-amd64
+
+# Coredumps (e.g. a tool crashing during a build/boot loop)
+core
+core.*

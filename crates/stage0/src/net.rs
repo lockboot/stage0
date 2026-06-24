@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Link/IP-layer network bring-up: connect the firmware's network drivers and
-//! obtain a DHCP lease, so the TCP4 transport, DNS4, and HTTP client can assume
-//! the interface is addressed. Nothing here is HTTP-specific.
+//! obtain a DHCP lease, so the TCP4 transport, UDP4 DNS resolver, and HTTP client can
+//! assume the interface is addressed. Nothing here is HTTP-specific.
 
 use uefi::boot;
 use uefi::proto::network::ip4config2::Ip4Config2;
@@ -16,9 +16,36 @@ const DHCP_POLL_INTERVAL_MS: u64 = 10;
 /// Give up on DHCP after this long.
 const DHCP_TIMEOUT_MS: u64 = 30_000;
 
+/// The ENA driver, built per-arch by the Makefile into `build/<arch>/ena.efi` and
+/// embedded unconditionally: stage0 + ena ship as ONE measured unit (the driver is
+/// covered by stage0's PCR4, no separate pin). EC2's Nitro firmware ships no ENA
+/// driver, so without this there is no SNP for the IP4/TCP4/UDP4 stack to bind.
+/// Building stage0 requires `build/<arch>/ena.efi` to exist (the Makefile builds it
+/// first); a missing file is a hard compile error, by design.
+#[cfg(target_arch = "x86_64")]
+static ENA_DRIVER: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/x86_64/ena.efi"));
+#[cfg(target_arch = "aarch64")]
+static ENA_DRIVER: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/aarch64/ena.efi"));
+
+/// Load and start any embedded UEFI NIC drivers, before connecting controllers, so a
+/// firmware that lacks a driver for its NIC (notably EC2/ENA) still gets an SNP
+/// producer. The driver is a well-behaved Driver-Model driver: inert on platforms
+/// whose NIC it does not match (GCP virtio-net, local QEMU).
+fn load_embedded_drivers() {
+    crate::slog!("stage0: loading embedded ena driver ({} bytes)", ENA_DRIVER.len());
+    match crate::secauth::load_image_verified(ENA_DRIVER) {
+        Ok(handle) => match boot::start_image(handle) {
+            Ok(()) => crate::slog!("stage0: ena driver started"),
+            Err(e) => crate::slog!("stage0: ena start_image failed: {:?}", e.status()),
+        },
+        Err(status) => crate::slog!("stage0: ena load_image failed: {status:?}"),
+    }
+}
+
 /// Bring the network up: connect the firmware's drivers, then obtain a DHCP lease.
 /// Call once before any networking.
 pub fn bringup() -> Result<(), Status> {
+    load_embedded_drivers();
     connect_all_controllers();
     let nic = boot::get_handle_for_protocol::<Ip4Config2>().map_err(|e| {
         crate::slog!(

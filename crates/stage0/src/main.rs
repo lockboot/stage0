@@ -31,6 +31,7 @@ mod sig;
 mod tcg2;
 mod tcp4;
 mod timing;
+mod udp4;
 
 use alloc::string::String;
 use config::Verify;
@@ -38,26 +39,38 @@ use sha2::{Digest, Sha256};
 use uefi::boot;
 use uefi::prelude::*;
 use uefi::proto::loaded_image::LoadedImage;
+use uefi::runtime::{self, ResetType};
 use uefi::CString16;
 
 /// PCR extended with SHA-256 of the loaded payload (matches stage1's binary PCR).
 const PCR_BINARY: u8 = 14;
 
+/// How long to hold before the fail-closed power-off. This is sized for the cloud,
+/// not the console UX: EC2's serial capture (`get-console-output`) only refreshes on
+/// the order of a minute, so a stage0 that errors early and powers off in a few
+/// seconds disappears before Nitro ever flushes the error to the captured buffer,
+/// leaving an operator with a terminated instance and ZERO log. Hold long enough to
+/// guarantee at least one capture cycle. The successful path never reaches here (the
+/// payload boots an OS); only failures pay this, where seeing why is worth the wait.
+const FAIL_CLOSED_DRAIN_US: usize = 90_000_000; // 90s
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
     match run() {
-        Ok(()) => {
-            crate::slog!("stage0: payload returned control to stage0 (unexpected)");
-            Status::LOAD_ERROR
-        }
-        Err(status) => {
-            crate::slog!("stage0: ERROR {:?}", status);
-            // Pause so the failure is visible on the serial console.
-            boot::stall(5_000_000);
-            status
-        }
+        // A real payload ExitBootServices and boots an OS; it must never return.
+        // If it does, the machine state is no longer trustworthy.
+        Ok(()) => crate::slog!("stage0: payload returned control to stage0 (unexpected)"),
+        Err(status) => crate::slog!("stage0: ERROR {status:?}"),
     }
+    // stage0 is the root of trust, so it never hands back to firmware: BdsDxe would
+    // boot another device or sit at a menu, and after control has left stage0 the
+    // platform (payload, firmware) can no longer be trusted. Fail CLOSED by powering
+    // the machine off. Hold first (see FAIL_CLOSED_DRAIN_US) so the cloud serial
+    // console actually captures the error before the instance halts.
+    crate::slog!("stage0: powering off in {}s (fail-closed)", FAIL_CLOSED_DRAIN_US / 1_000_000);
+    boot::stall(FAIL_CLOSED_DRAIN_US);
+    runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None)
 }
 
 fn run() -> Result<(), Status> {
@@ -96,7 +109,7 @@ fn run() -> Result<(), Status> {
     };
 
     // Payload download over the same raw-TCP4 HTTP client (a hostname URL is
-    // resolved via EFI_DNS4; an IPv4 literal connects directly).
+    // resolved via DNS over UDP4; an IPv4 literal connects directly).
     crate::sdbg!("stage0:   downloading payload from {url}");
     let binary = http::download(&url)?;
     crate::slog!("stage0: payload: {} bytes from {url}", binary.len());

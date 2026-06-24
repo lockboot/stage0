@@ -95,10 +95,22 @@ build/keys/release.pem: docker-build-base
 		openssl pkey -in build/keys/release.pem -pubout -outform DER \
 			| tail -c 32 | base64 -w0 > build/keys/release.pub.b64"
 
+# ---- Build the ena.efi UEFI driver (embedded into stage0 for EC2/ENA netboot) ----
+# A resident SimpleNetworkProtocol driver for the AWS ENA NIC, which Nitro's UEFI
+# firmware does not provide. stage0 include_bytes! build/$*/ena.efi unconditionally.
+# Mark precious: it is only a prerequisite of the stage0.efi pattern rule, so make
+# would otherwise treat it as a chained intermediate and delete it after the build.
+.PRECIOUS: build/%/ena.efi
+build/%/ena.efi: docker-build-base
+	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
+		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path crates/ena/Cargo.toml --target $*-unknown-uefi && cp -v crates/ena/target/$*-unknown-uefi/release/ena.efi $@"
+
 # ---- Build the stage0 UEFI binary ----
 # mkdir runs inside the container (as DOCKER_SAMEUSER) so the output dir is owned
 # by the build user, not by the host caller (which is root under `gh act`).
-build/%/stage0.efi: docker-build-base
+# stage0 include_bytes! build/$*/ena.efi unconditionally (one measured unit), so the
+# ena.efi prerequisite must be built first; nothing extra to pass on the command line.
+build/%/stage0.efi: build/%/ena.efi docker-build-base
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
 		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path $(STAGE0_DIR)/Cargo.toml --target $*-unknown-uefi && cp -v $(STAGE0_DIR)/target/$*-unknown-uefi/release/stage0.efi $@"
 

@@ -2,11 +2,11 @@
 
 //! A trivial UEFI payload for exercising the stage0 netboot path end to end.
 //!
-//! When chain-loaded by stage0 it prints a banner and reads back PCR 14 (the
-//! payload measurement) over `EFI_TCG2_PROTOCOL`, proving the
-//! measure-then-execute flow worked. PCR 15 is read too and should be all-zero,
-//! confirming stage0 measures only the binary. A real payload would instead set
-//! up and boot its own OS.
+//! When chain-loaded by stage0 it prints a banner and dumps every allocated PCR
+//! in every active bank over `EFI_TCG2_PROTOCOL`, proving the
+//! measure-then-execute flow worked (PCR 14 holds the payload measurement) and
+//! giving the predictor/verifier a full reference set to validate against. A real
+//! payload would instead set up and boot its own OS.
 
 #![no_std]
 #![no_main]
@@ -14,6 +14,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use anyhow::{anyhow, bail, Result};
@@ -21,7 +22,7 @@ use uefi::boot::{self, ScopedProtocol};
 use uefi::prelude::*;
 use uefi::println;
 use uefi::proto::tcg::v2::Tcg;
-use vaportpm_attest::{PcrOps, TpmAlg, TpmTransport};
+use vaportpm_attest::{PcrOps, TpmTransport};
 
 struct Tcg2Transport {
     tcg: ScopedProtocol<Tcg>,
@@ -56,9 +57,17 @@ fn main() -> Status {
         Err(e) => println!("payload: could not read PCRs: {e}"),
     }
 
-    // A real payload would ExitBootServices and boot an OS here.
+    // EC2's serial console buffer is only flushed periodically; if the payload
+    // returns immediately, stage0 falls through, the VM resets/terminates, and the
+    // PCR dump above never makes it out. Hold ~60s before handing back, with a
+    // heartbeat so it is visibly alive and the console keeps draining.
+    println!("payload: holding ~60s so the serial console drains...");
+    for i in 1..=6 {
+        boot::stall(10_000_000); // 10s
+        println!("payload: drain {i}/6 (~{}s)", i * 10);
+    }
+
     println!("payload: done");
-    boot::stall(5_000_000);
     Status::SUCCESS
 }
 
@@ -77,8 +86,24 @@ fn print_pcrs() -> Result<()> {
         max_response_size,
     }));
 
-    for (idx, value) in tpm.pcr_read_bank(&[14, 15], TpmAlg::Sha256)? {
-        println!("payload: PCR{idx} (sha256) = {}", hex::encode(value));
+    // Which banks are active, so the verifier knows which algs to expect.
+    let mut banks_line = String::from("payload: active PCR banks:");
+    for alg in tpm.get_active_pcr_banks()? {
+        banks_line.push(' ');
+        banks_line.push_str(alg.name());
     }
+    println!("{banks_line}");
+
+    // Dump every allocated PCR in every active bank (including all-zero ones),
+    // bracketed by stable markers so the predictor can scrape the block out of a
+    // noisy cloud serial log. Line format: "payload: PCR <alg> <idx2> <hex>".
+    let mut pcrs = tpm.read_all_allocated_pcrs()?;
+    pcrs.sort_by_key(|(idx, alg, _)| (*idx, *alg as u16));
+
+    println!("payload: ===PCR-DUMP-BEGIN===");
+    for (idx, alg, value) in &pcrs {
+        println!("payload: PCR {} {idx:02} {}", alg.name(), hex::encode(value));
+    }
+    println!("payload: ===PCR-DUMP-END===");
     Ok(())
 }
