@@ -139,21 +139,24 @@ STAGE0_QEMU = $(DOCKER_RUN) $(DOCKER_OPT_KVM) \
 	$(HARNESS_IMAGE)
 
 # Boot stage0 under QEMU. Defaults to the signed test payload and regenerates the
-# user-data each run so it can never go stale.
+# user-data each run so it can never go stale. FALLBACK=1 makes the _stage1 url a list
+# [dead 10.0.2.1:9, real] so the mirror-fallback loop is exercised (first url refused).
 boot-%: build/%/boot.disk build/%/payload.efi docker-build-harness
 	@P="$(PAYLOAD)"; [ -n "$$P" ] || P="build/$*/payload.efi"; \
+	URLVAL="\"$(PAYLOAD_URL)\""; \
+	if [ -n "$(FALLBACK)" ]; then URLVAL="[ \"http://10.0.2.1:9/payload.efi\", \"$(PAYLOAD_URL)\" ]"; echo "fallback: _stage1 url = [dead 10.0.2.1:9, $(PAYLOAD_URL)]"; fi; \
 	if [ -n "$(USER_DATA)" ]; then \
 		cp "$(USER_DATA)" user-data.stage0.json; \
 		echo "Using user-data from $(USER_DATA)"; \
 	elif [ -f "$$P.sig" ] && [ -f build/keys/release.pub.b64 ]; then \
 		PUB=$$(cat build/keys/release.pub.b64); \
-		printf '{\n  "_stage1": {\n    "%s": { "url": "%s", "ed25519": "%s" }\n  }\n}\n' \
-			"$*" "$(PAYLOAD_URL)" "$$PUB" > user-data.stage0.json; \
+		printf '{\n  "_stage1": {\n    "%s": { "url": %s, "ed25519": "%s" }\n  }\n}\n' \
+			"$*" "$$URLVAL" "$$PUB" > user-data.stage0.json; \
 		echo "Wrote user-data.stage0.json (signed mode, release pubkey $$PUB)"; \
 	else \
 		SHA=$$(sha256sum "$$P" | cut -d' ' -f1); \
-		printf '{\n  "_stage1": {\n    "%s": { "url": "%s", "sha256": "%s" }\n  }\n}\n' \
-			"$*" "$(PAYLOAD_URL)" "$$SHA" > user-data.stage0.json; \
+		printf '{\n  "_stage1": {\n    "%s": { "url": %s, "sha256": "%s" }\n  }\n}\n' \
+			"$*" "$$URLVAL" "$$SHA" > user-data.stage0.json; \
 		echo "Wrote user-data.stage0.json (sha256 mode, $$SHA)"; \
 	fi; \
 	$(STAGE0_QEMU) --kind stage0 --arch $* \

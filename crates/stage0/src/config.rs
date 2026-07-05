@@ -12,6 +12,27 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::Deserialize;
 
+/// One URL, or a fallback list tried in order (mirror resiliency). Deserializes from a
+/// JSON string or an array of strings. stage0 is http-only (no TLS); trying mirrors is
+/// safe because the payload is cryptographically pinned, so bytes from any URL must verify.
+#[derive(Debug, Clone)]
+pub struct UrlList(pub Vec<String>);
+
+impl<'de> Deserialize<'de> for UrlList {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OneOrMany {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(match OneOrMany::deserialize(d)? {
+            OneOrMany::One(s) => UrlList(alloc::vec![s]),
+            OneOrMany::Many(v) => UrlList(v),
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UserData {
     #[serde(rename = "_stage1")]
@@ -34,7 +55,7 @@ pub struct Stage1Config {
 
 #[derive(Debug, Deserialize)]
 pub struct ArchConfig {
-    pub url: String,
+    pub url: UrlList,
     // Exactly one of these selects the verification mode (see `verify`):
     //   sha256  → pin an exact hash (immutable payload).
     //   ed25519 → pin a long-term release pubkey (base64); the payload may roll
@@ -45,19 +66,19 @@ pub struct ArchConfig {
     pub ed25519: Option<String>,
     /// Where the detached ed25519 signature lives (signed mode). Any `{sha256}`
     /// is replaced with the payload's hex digest, so the signature can be
-    /// content-addressed. Defaults to `<url>.sig` when omitted.
+    /// content-addressed. Defaults to `<url>.sig` when omitted. String or list.
     #[serde(default)]
-    pub sig_url: Option<String>,
+    pub sig_url: Option<UrlList>,
     /// Optional signed load options (ed25519 mode only). The args are fetched from
     /// `args_url` (with `{sha256}` substituted), and their detached signature from
     /// `args_sig_url` (with `{sha256}` substituted), or `<args_url>.sig` when that
     /// is omitted. The signature is verified against the same release key as the
     /// payload; the verified bytes are used verbatim as the payload's UEFI load
-    /// options, overriding inline `args`.
+    /// options, overriding inline `args`. String or list.
     #[serde(default)]
-    pub args_url: Option<String>,
+    pub args_url: Option<UrlList>,
     #[serde(default)]
-    pub args_sig_url: Option<String>,
+    pub args_sig_url: Option<UrlList>,
 }
 
 /// How stage0 admits the downloaded payload before measuring + loading it.
@@ -71,9 +92,9 @@ pub enum Verify {
     /// still carry an unsubstituted `{sha256}`; the caller substitutes it.
     Ed25519 {
         pubkey: String,
-        sig_url: Option<String>,
-        args_url: Option<String>,
-        args_sig_url: Option<String>,
+        sig_url: Option<UrlList>,
+        args_url: Option<UrlList>,
+        args_sig_url: Option<UrlList>,
     },
 }
 
@@ -103,23 +124,20 @@ impl ArchConfig {
         // http:// only: stage0's TCP4 client speaks plain HTTP, TLS is not used
         // (integrity comes from the pin/signature, not the transport). Rejecting
         // https:// here turns an unfetchable URL into a clear config-time error
-        // rather than a late download failure.
-        if !self.url.starts_with("http://") {
-            return Err("url must start with http:// (TLS is not supported)");
-        }
-        if !self.url.chars().all(|c| c.is_ascii_graphic()) {
-            return Err("url must contain only printable ASCII");
-        }
-        // Same transport rule as `url` for the optional signature/args URLs.
+        // rather than a late download failure. Each field is a URL or a fallback list.
         let ok_url = |s: &str| s.starts_with("http://") && s.chars().all(|c| c.is_ascii_graphic());
-        if self.sig_url.as_deref().is_some_and(|s| !ok_url(s)) {
-            return Err("sig_url must start with http:// and be printable ASCII");
+        let ok_list = |l: &UrlList| !l.0.is_empty() && l.0.iter().all(|s| ok_url(s));
+        if !ok_list(&self.url) {
+            return Err("url must be a non-empty http:// URL (or list of them), printable ASCII (TLS unsupported)");
         }
-        if self.args_url.as_deref().is_some_and(|s| !ok_url(s)) {
-            return Err("args_url must start with http:// and be printable ASCII");
+        if self.sig_url.as_ref().is_some_and(|l| !ok_list(l)) {
+            return Err("sig_url must be http:// URL(s), printable ASCII");
         }
-        if self.args_sig_url.as_deref().is_some_and(|s| !ok_url(s)) {
-            return Err("args_sig_url must start with http:// and be printable ASCII");
+        if self.args_url.as_ref().is_some_and(|l| !ok_list(l)) {
+            return Err("args_url must be http:// URL(s), printable ASCII");
+        }
+        if self.args_sig_url.as_ref().is_some_and(|l| !ok_list(l)) {
+            return Err("args_sig_url must be http:// URL(s), printable ASCII");
         }
         if self.args_sig_url.is_some() && self.args_url.is_none() {
             return Err("args_sig_url requires args_url");
