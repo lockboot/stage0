@@ -34,7 +34,8 @@ mod timing;
 mod udp4;
 
 use alloc::string::String;
-use config::Verify;
+use alloc::vec::Vec;
+use config::{UrlList, Verify};
 use sha2::{Digest, Sha256};
 use uefi::boot;
 use uefi::prelude::*;
@@ -80,7 +81,7 @@ fn run() -> Result<(), Status> {
 
     // Bring the network up once (DHCP), then fetch metadata. Metadata and payload
     // both ride the raw-TCP4 HTTP client (http.rs).
-    let (url, verify, args) = {
+    let (urls, verify, args) = {
         net::bringup()?;
 
         // An embedded `_stage1` section is part of the signed, measured PE, so it
@@ -105,49 +106,13 @@ fn run() -> Result<(), Status> {
             crate::slog!("stage0: invalid arch config: {m}");
             Status::INVALID_PARAMETER
         })?;
-        (arch.url.clone(), verify, user_data.stage1.args.clone())
+        (arch.url.0.clone(), verify, user_data.stage1.args.clone())
     };
 
-    // Payload download over the same raw-TCP4 HTTP client (a hostname URL is
-    // resolved via DNS over UDP4; an IPv4 literal connects directly).
-    crate::sdbg!("stage0:   downloading payload from {url}");
-    let binary = http::download(&url)?;
-    crate::slog!("stage0: payload: {} bytes from {url}", binary.len());
-
-    // Admission control. PCR 14 always records the SHA-256 of what we load; the
-    // policy below only decides whether we are *allowed* to load it.
-    let digest = sha256(&binary);
-    let hash = hex::encode(digest);
+    // Try each mirror URL in order until one downloads and admits. Content is pinned,
+    // so any mirror that yields verifying bytes is acceptable (fallback for resiliency).
     // Signed remote load options (ed25519 mode), if any, override the inline `args`.
-    let mut signed_args: Option<String> = None;
-    match &verify {
-        Verify::Sha256(expected) => {
-            if !hash.eq_ignore_ascii_case(expected) {
-                crate::slog!("stage0: SHA256 mismatch! expected {expected}, got {hash}");
-                return Err(Status::SECURITY_VIOLATION);
-            }
-            crate::slog!("stage0: verified: sha256:{hash} (sha256 pin)");
-        }
-        Verify::Ed25519 { pubkey, sig_url, args_url, args_sig_url } => {
-            // Detached signature: the `sig_url` template with `{sha256}` replaced by
-            // the payload digest (content-addressable), else `<url>.sig`.
-            let sig_url = match sig_url {
-                Some(t) => t.replace("{sha256}", &hash),
-                None => alloc::format!("{url}.sig"),
-            };
-            crate::sdbg!("stage0:   fetching signature from {sig_url}");
-            let signature = http::download(&sig_url)?;
-            sig::verify(pubkey, &binary, &signature).map_err(|m| {
-                crate::slog!("stage0: ed25519 verification failed: {m}");
-                Status::SECURITY_VIOLATION
-            })?;
-            crate::slog!("stage0: verified: sha256:{hash} (ed25519 key:{pubkey})");
-
-            if let Some(au) = args_url {
-                signed_args = Some(fetch_signed_args(au, args_sig_url.as_deref(), pubkey, &hash)?);
-            }
-        }
-    }
+    let (binary, digest, signed_args) = admit_payload(&urls, &verify)?;
 
     // Measure before executing. Only PCR 14 (the binary): the config/key are not
     // measured, so attestation is simply "stage0 ran and loaded this hash".
@@ -191,25 +156,97 @@ fn measure(tpm: &mut vaportpm_attest::Tpm, pcr: u8, data: &[u8]) -> Result<(), S
     })
 }
 
-/// Fetch and verify signed load options (ed25519 mode). `args_url`/`args_sig_url`
-/// may contain `{sha256}` (replaced with the payload digest). The detached
-/// signature, from `args_sig_url` or `<args_url>.sig`, must verify against the
-/// release `pubkey`; the verified bytes are returned verbatim (trimmed) as the
-/// load-options string.
+/// Replace `{sha256}` in each URL with the payload's hex digest (content-addressing).
+fn substitute(urls: &[String], hash: &str) -> Vec<String> {
+    urls.iter().map(|u| u.replace("{sha256}", hash)).collect()
+}
+
+/// Download the first URL that responds (fallback across mirrors).
+fn download_first(urls: &[String]) -> Result<Vec<u8>, Status> {
+    let mut last = Status::NOT_FOUND;
+    for url in urls {
+        match http::download(url) {
+            Ok(bytes) => return Ok(bytes),
+            Err(s) => {
+                crate::slog!("stage0: url unavailable: {url} ({s:?})");
+                last = s;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Try each payload URL until one downloads and admits (content is pinned, so any mirror
+/// that yields verifying bytes is acceptable). Returns the bytes, their SHA-256 digest,
+/// and any verified signed load options.
+fn admit_payload(urls: &[String], verify: &Verify) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+    let mut last = Status::NOT_FOUND;
+    for url in urls {
+        match admit_from(url, verify) {
+            Ok(result) => return Ok(result),
+            Err(s) => {
+                crate::slog!("stage0: payload url rejected: {url} ({s:?})");
+                last = s;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Download one payload candidate and run admission control (a gate — never measured).
+fn admit_from(url: &str, verify: &Verify) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+    crate::sdbg!("stage0:   downloading payload from {url}");
+    let binary = http::download(url)?;
+    crate::slog!("stage0: payload: {} bytes from {url}", binary.len());
+    let digest = sha256(&binary);
+    let hash = hex::encode(digest);
+    let mut signed_args: Option<String> = None;
+    match verify {
+        Verify::Sha256(expected) => {
+            if !hash.eq_ignore_ascii_case(expected) {
+                crate::slog!("stage0: SHA256 mismatch! expected {expected}, got {hash}");
+                return Err(Status::SECURITY_VIOLATION);
+            }
+            crate::slog!("stage0: verified: sha256:{hash} (sha256 pin)");
+        }
+        Verify::Ed25519 { pubkey, sig_url, args_url, args_sig_url } => {
+            // Detached signature: the `sig_url` templates with `{sha256}` replaced by the
+            // payload digest (content-addressable), else `<url>.sig` (co-located per mirror).
+            let sig_urls = match sig_url {
+                Some(u) => substitute(&u.0, &hash),
+                None => alloc::vec![alloc::format!("{url}.sig")],
+            };
+            let signature = download_first(&sig_urls)?;
+            sig::verify(pubkey, &binary, &signature).map_err(|m| {
+                crate::slog!("stage0: ed25519 verification failed: {m}");
+                Status::SECURITY_VIOLATION
+            })?;
+            crate::slog!("stage0: verified: sha256:{hash} (ed25519 key:{pubkey})");
+            if let Some(au) = args_url {
+                signed_args = Some(fetch_signed_args(&au.0, args_sig_url.as_ref(), pubkey, &hash)?);
+            }
+        }
+    }
+    Ok((binary, digest, signed_args))
+}
+
+/// Fetch and verify signed load options (ed25519 mode). `args_url`/`args_sig_url` may
+/// contain `{sha256}` (replaced with the payload digest) and may each be a fallback list.
+/// The detached signature (from `args_sig_url`, else `<args_url>.sig`) must verify against
+/// the release `pubkey`; the verified bytes are returned verbatim (trimmed) as load options.
 fn fetch_signed_args(
-    args_url: &str,
-    args_sig_url: Option<&str>,
+    args_urls: &[String],
+    args_sig_url: Option<&UrlList>,
     pubkey: &str,
     payload_hash: &str,
 ) -> Result<String, Status> {
-    let args_url = args_url.replace("{sha256}", payload_hash);
-    let sig_url = match args_sig_url {
-        Some(s) => s.replace("{sha256}", payload_hash),
-        None => alloc::format!("{args_url}.sig"),
+    let args_urls = substitute(args_urls, payload_hash);
+    let sig_urls = match args_sig_url {
+        Some(u) => substitute(&u.0, payload_hash),
+        None => args_urls.iter().map(|u| alloc::format!("{u}.sig")).collect(),
     };
-    crate::sdbg!("stage0:   fetching signed args from {args_url}");
-    let args = http::download(&args_url)?;
-    let sig = http::download(&sig_url)?;
+    let args = download_first(&args_urls)?;
+    let sig = download_first(&sig_urls)?;
     sig::verify(pubkey, &args, &sig).map_err(|m| {
         crate::slog!("stage0: signed args verification failed: {m}");
         Status::SECURITY_VIOLATION
