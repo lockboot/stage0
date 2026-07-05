@@ -78,7 +78,7 @@ pub fn fetch(
     req.push_str("Connection: close\r\nUser-Agent: stage0\r\n\r\n");
     crate::sdbg!("stage0:   HTTP {} {url}", method.as_str());
 
-    let raw = tcp4::exchange(ip, port, req.as_bytes())?;
+    let mut raw = tcp4::exchange(ip, port, req.as_bytes())?;
 
     let sep = find_subslice(&raw, b"\r\n\r\n").ok_or_else(|| {
         crate::slog!("stage0:   response had no header terminator");
@@ -88,7 +88,9 @@ pub fn fetch(
         crate::slog!("stage0:   could not parse HTTP status line");
         Status::PROTOCOL_ERROR
     })?;
-    let body = raw[sep + 4..].to_vec();
+    // Hand back the body by reusing `raw`'s allocation (drop the headers in place)
+    // instead of copying the whole payload into a fresh Vec.
+    let body = raw.split_off(sep + 4);
     crate::sdbg!("stage0:     response {status}, {} body bytes", body.len());
     Ok((status, body))
 }
