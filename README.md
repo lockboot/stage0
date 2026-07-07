@@ -64,6 +64,16 @@ arch entry needs `url` **and exactly one** of `sha256` or `ed25519`.
 `args_url` content is verified against `ed25519` (the same release key as the
 payload) and used verbatim, trimmed, as the load-options string.
 
+**Args model.** `args` / `args_url` set the booted EFI program's UEFI **LoadOptions** —
+the generic way stage0 parameterizes whatever EFI image it chain-loads. They come **only**
+from this metadata (or the signed URL); stage0 never forwards its own firmware/shell
+invocation arguments to stage1. For a **Linux UKI** stage1, the kernel command line is
+baked into the signed, measured UKI and is authoritative: under Secure Boot the systemd
+stub **ignores** LoadOptions, so `args` cannot alter the UKI cmdline (and a replace would
+also escape PCR 14). Production runs Secure Boot on; configure a UKI-based stage1 through
+its `_stage2` document, not the kernel cmdline. A non-UKI EFI stage1 may read these
+LoadOptions as its arguments.
+
 ### Embedded metadata (self-contained `netboot.efi`)
 
 The `_stage1` document can be embedded in stage0's PE before Authenticode

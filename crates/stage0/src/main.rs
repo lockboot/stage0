@@ -264,6 +264,14 @@ fn fetch_signed_args(
 /// Set the loaded image's load options from the final `opts` string (UCS-2).
 /// Returns the backing [`CString16`], which the caller must keep alive until
 /// `start_image`.
+///
+/// `opts` is sourced only from the metadata `_stage1.args` or the signed `args_url`
+/// (see `run`); stage0 never reads or forwards its own firmware/shell invocation
+/// arguments to the child. For a Linux UKI child these LoadOptions would be the kernel
+/// command line, but the UKI bakes + measures its own `.cmdline` and the stub ignores
+/// LoadOptions under Secure Boot -- so on a UKI in production this has no effect, by
+/// design (operator config for a UKI flows through `_stage2`). A non-UKI EFI stage1
+/// reads these as its arguments.
 fn set_load_options(image: Handle, opts: Option<&str>) -> Option<CString16> {
     let opts = opts?;
     if opts.is_empty() {

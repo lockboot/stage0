@@ -5,6 +5,15 @@
 //! Mirrors `stage1`'s per-arch `{url, sha256}` structure (plus optional `args`)
 //! but under a distinct `_stage1` key, so a UEFI payload is never confused with
 //! a Linux `_stage2` binary in the same document.
+//!
+//! `args` (and the signed `args_url`) set the booted EFI program's UEFI *LoadOptions* --
+//! the generic way stage0 parameterizes whatever EFI image it chain-loads. They are
+//! sourced ONLY from this metadata (or the signed URL); stage0 never forwards its own
+//! firmware/shell invocation arguments to stage1. For a Linux UKI stage1 specifically,
+//! the kernel command line is baked into the signed, measured UKI and is authoritative:
+//! under Secure Boot the stub ignores LoadOptions, so `_stage1.args` cannot alter the UKI
+//! cmdline (operator config for a UKI flows through `_stage2`, not the kernel cmdline).
+//! A non-UKI EFI stage1 is free to read these LoadOptions as its arguments.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -41,6 +50,9 @@ pub struct UserData {
 
 #[derive(Debug, Deserialize)]
 pub struct Stage1Config {
+    /// Inline UEFI LoadOptions for the booted stage1 EFI image (a non-UKI stage1 reads
+    /// these as its args). Overridden by the signed `args_url`. See the module docs for
+    /// how a Linux UKI treats these (baked cmdline wins; ignored under Secure Boot).
     #[serde(default)]
     pub args: Option<Vec<String>>,
     // Exactly one of these is read per build (see `for_this_arch`); the other
