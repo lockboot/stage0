@@ -25,9 +25,8 @@ it at your payload with a `_stage1` user-data document:
          "sha256": "<64-hex sha256>"
       },
       "aarch64": {
-         "url": "http://cdn.example.com/app.efi",
          "ed25519": "<base64 pubkey>",
-         "args_url": "http://cdn.example.com/app.args",  // optional
+         "manifest_url": "http://cdn.example.com/app.manifest.json"
       }
    }
 }
@@ -35,44 +34,55 @@ it at your payload with a `_stage1` user-data document:
 
 Per arch, pick the admission mode:
 
-- **`sha256`**: pin an exact hash. Immutable; re-pin for every build.
-- **`ed25519`**: pin a long-term release public key. The payload rolls forward
-  without editing metadata: sign each build offline and serve the detached
-  signature at `<url>.sig`, or at a `sig_url` of your choice. A `{sha256}` in
-  `sig_url` is replaced with the payload's hash, so signatures can be
-  content-addressed (e.g. `http://cdn.example.com/sigs/{sha256}.sig`).
+- **`sha256`**: pin an exact hash inline (`url` + `sha256`). Immutable; re-pin for every build.
+- **`ed25519`**: pin a long-term release public key **and** a `manifest_url`. stage0 fetches a
+  **signed manifest** from that URL (`{ "url", "sha256", "args", "version" }`), verifies its
+  detached signature against the pinned key, then admits the payload by the manifest's exact
+  `sha256`. Because the payload and its args are bound under **one** signature, a hostile mirror
+  can neither mix-and-match independently-signed pieces nor roll the payload back to an old signed
+  build -- yet you still roll forward by re-signing a new manifest (the user-data is unchanged).
+  The signature is served at `<manifest_url>.sig`, or a `manifest_sig_url` of your choice (a
+  `{sha256}` there is replaced with the *manifest's* hash, for content-addressing).
 
 The payload must be a UEFI PE. However the firmware `db` feels about it, stage0
 admits it by your pin/signature and measures it into **PCR 14** (= its SHA-256).
 
 ## `_stage1` metadata reference
 
-A `_stage1` object with an optional `args` and one entry per architecture. Each
-arch entry needs `url` **and exactly one** of `sha256` or `ed25519`.
+A `_stage1` object with an optional inline `args` and one entry per architecture. Each arch
+entry uses **exactly one** of `sha256` (static) or `ed25519` (signed manifest).
 
 | Field | In | Type | Rules |
 |---|---|---|---|
-| `args` | `_stage1` | `string[]` | optional; passed to the payload as UEFI load options |
+| `args` | `_stage1` | `string[]` | optional inline LoadOptions (sha256 mode; ed25519 mode uses the manifest's `args`) |
 | `x86_64` / `aarch64` | `_stage1` | object | per-arch entry; the running arch's must be present |
-| `url` | arch entry | `string` | `http://…`, printable ASCII (TLS is not used) |
-| `sha256` | arch entry | `string` | exactly 64 hex characters |
-| `ed25519` | arch entry | `string` | base64 of a 32-byte public key |
-| `sig_url` | arch entry | `string` | optional (signed mode); payload signature location, `{sha256}` → payload hash. Defaults to `<url>.sig` |
-| `args_url` | arch entry | `string` | optional (signed mode only); fetch signed load options here, `{sha256}` → payload hash. Overrides inline `args` |
-| `args_sig_url` | arch entry | `string` | optional; signature for `args_url`, `{sha256}` → payload hash. Defaults to `<args_url>.sig`. Requires `args_url` |
+| `url` | arch entry | `string`/list | **sha256 mode**: payload location(s), `http://…` printable ASCII (TLS not used) |
+| `sha256` | arch entry | `string` | **sha256 mode**: exactly 64 hex characters |
+| `ed25519` | arch entry | `string` | **ed25519 mode**: base64 of a 32-byte release public key |
+| `manifest_url` | arch entry | `string`/list | **ed25519 mode**: where the signed manifest is fetched |
+| `manifest_sig_url` | arch entry | `string`/list | optional; manifest signature location, `{sha256}` → *manifest* hash. Defaults to `<manifest_url>.sig` |
 
-`args_url` content is verified against `ed25519` (the same release key as the
-payload) and used verbatim, trimmed, as the load-options string.
+The **manifest** (ed25519 mode) is fetched from `manifest_url` and verified against `ed25519`:
 
-**Args model.** `args` / `args_url` set the booted EFI program's UEFI **LoadOptions** —
-the generic way stage0 parameterizes whatever EFI image it chain-loads. They come **only**
-from this metadata (or the signed URL); stage0 never forwards its own firmware/shell
-invocation arguments to stage1. For a **Linux UKI** stage1, the kernel command line is
-baked into the signed, measured UKI and is authoritative: under Secure Boot the systemd
-stub **ignores** LoadOptions, so `args` cannot alter the UKI cmdline (and a replace would
-also escape PCR 14). Production runs Secure Boot on; configure a UKI-based stage1 through
-its `_stage2` document, not the kernel cmdline. A non-UKI EFI stage1 may read these
-LoadOptions as its arguments.
+| Field | Type | Rules |
+|---|---|---|
+| `url` | `string`/list | payload location(s); a `{sha256}` is replaced with the `sha256` below |
+| `sha256` | `string` | the payload's exact 64 hex digest |
+| `args` | `string[]` | optional; passed to the payload as LoadOptions |
+| `version` | number | optional monotonic release version (anti-rollback hint; not yet enforced) |
+
+Every URL field takes a single string or a fallback list (mirror resiliency); the content is
+cryptographically pinned, so any mirror that verifies is accepted.
+
+**Args model.** `args` (inline, sha256 mode) or the signed manifest's `args` (ed25519 mode) set
+the booted EFI program's UEFI **LoadOptions** — the generic way stage0 parameterizes whatever EFI
+image it chain-loads. They come **only** from this metadata (or the signed manifest); stage0 never
+forwards its own firmware/shell invocation arguments to stage1. For a **Linux UKI** stage1, the
+kernel command line is baked into the signed, measured UKI and is authoritative: under Secure Boot
+the systemd stub **ignores** LoadOptions, so these cannot alter the UKI cmdline (and a replace
+would also escape PCR 14). Production runs Secure Boot on; configure a UKI-based stage1 through its
+`_stage2` document, not the kernel cmdline. A non-UKI EFI stage1 may read these LoadOptions as its
+arguments.
 
 ### Embedded metadata (self-contained `netboot.efi`)
 

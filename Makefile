@@ -121,16 +121,25 @@ build/%/boot.disk: build/%/stage0.efi build/keys/db.crt
 build-amd64 build-x86_64:  build/x86_64/boot.disk
 build-arm64 build-aarch64: build/aarch64/boot.disk
 
-# ---- Test payload: a chain-loaded UEFI app that reads PCRs, ed25519-signed ----
+# ---- Test payload: a chain-loaded UEFI app that reads PCRs ----
 # Served at a hostname (not an IP) so the test also exercises EFI_DNS4; qemu-test.sh
 # maps payload.lockboot.test -> 10.0.2.1. Override SERVE_HOST=10.0.2.1:8000 to skip DNS.
 SERVE_HOST ?= payload.lockboot.test:8000
 PAYLOAD_URL ?= http://$(SERVE_HOST)/payload.efi
-build/%/payload.efi: docker-build-base build/keys/release.pem
+build/%/payload.efi: docker-build-base
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
 		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path crates/stage0-test-payload/Cargo.toml --target $*-unknown-uefi && \
-			cp crates/stage0-test-payload/target/$*-unknown-uefi/release/stage0-test-payload.efi $@ && \
-			openssl pkeyutl -sign -inkey build/keys/release.pem -rawin -in $@ -out $@.sig"
+			cp crates/stage0-test-payload/target/$*-unknown-uefi/release/stage0-test-payload.efi $@"
+
+# ---- Signed release manifest for the test payload (ed25519 mode) ----
+# Pins the payload url + sha256, ed25519-signed with the release key. stage0 fetches + verifies
+# THIS (not a per-payload sig), then admits the payload by the pinned hash. The detached sig is
+# co-located at <manifest>.sig.
+build/%/manifest.json: build/%/payload.efi build/keys/release.pem
+	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
+		SHA=\$$(sha256sum build/$*/payload.efi | cut -d' ' -f1); \
+		printf '{ \"url\": \"$(PAYLOAD_URL)\", \"sha256\": \"%s\", \"args\": [], \"version\": 1 }\n' \"\$$SHA\" > $@ && \
+		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin -in $@ -out $@.sig"
 
 # ---- QEMU harness: the lean harness image bakes qemu-test.sh as its entrypoint
 # (and the EC2_MOCK_CACHE + iptables-ack env), so we just append CLI args. ----
@@ -138,30 +147,33 @@ STAGE0_QEMU = $(DOCKER_RUN) $(DOCKER_OPT_KVM) \
 	--cap-add=NET_ADMIN --device=/dev/net/tun \
 	$(HARNESS_IMAGE)
 
-# Boot stage0 under QEMU. Defaults to the signed test payload and regenerates the
-# user-data each run so it can never go stale. FALLBACK=1 makes the _stage1 url a list
-# [dead 10.0.2.1:9, real] so the mirror-fallback loop is exercised (first url refused).
-boot-%: build/%/boot.disk build/%/payload.efi docker-build-harness
+# Boot stage0 under QEMU. Defaults to signed-manifest (ed25519) admission and regenerates the
+# user-data each run so it can never go stale. The serve dir holds the payload + the signed
+# manifest (+ its .sig). Knobs: SHA256=1 uses inline sha256 admission instead; FALLBACK=1 makes
+# the _stage1 manifest_url a list [dead 10.0.2.1:9, real] so the mirror-fallback loop is exercised.
+boot-%: build/%/boot.disk build/%/payload.efi build/%/manifest.json docker-build-harness
 	@P="$(PAYLOAD)"; [ -n "$$P" ] || P="build/$*/payload.efi"; \
-	URLVAL="\"$(PAYLOAD_URL)\""; \
-	if [ -n "$(FALLBACK)" ]; then URLVAL="[ \"http://10.0.2.1:9/payload.efi\", \"$(PAYLOAD_URL)\" ]"; echo "fallback: _stage1 url = [dead 10.0.2.1:9, $(PAYLOAD_URL)]"; fi; \
+	D="build/$*/serve"; rm -rf "$$D"; mkdir -p "$$D"; cp "$$P" "$$D/payload.efi"; \
+	MURL="\"http://$(SERVE_HOST)/manifest.json\""; \
+	if [ -n "$(FALLBACK)" ]; then MURL="[ \"http://10.0.2.1:9/manifest.json\", \"http://$(SERVE_HOST)/manifest.json\" ]"; echo "fallback: manifest_url = [dead 10.0.2.1:9, real]"; fi; \
 	if [ -n "$(USER_DATA)" ]; then \
 		cp "$(USER_DATA)" user-data.stage0.json; \
 		echo "Using user-data from $(USER_DATA)"; \
-	elif [ -f "$$P.sig" ] && [ -f build/keys/release.pub.b64 ]; then \
-		PUB=$$(cat build/keys/release.pub.b64); \
-		printf '{\n  "_stage1": {\n    "%s": { "url": %s, "ed25519": "%s" }\n  }\n}\n' \
-			"$*" "$$URLVAL" "$$PUB" > user-data.stage0.json; \
-		echo "Wrote user-data.stage0.json (signed mode, release pubkey $$PUB)"; \
-	else \
+	elif [ -n "$(SHA256)" ]; then \
 		SHA=$$(sha256sum "$$P" | cut -d' ' -f1); \
-		printf '{\n  "_stage1": {\n    "%s": { "url": %s, "sha256": "%s" }\n  }\n}\n' \
-			"$*" "$$URLVAL" "$$SHA" > user-data.stage0.json; \
+		printf '{\n  "_stage1": { "%s": { "url": "http://$(SERVE_HOST)/payload.efi", "sha256": "%s" } }\n}\n' \
+			"$*" "$$SHA" > user-data.stage0.json; \
 		echo "Wrote user-data.stage0.json (sha256 mode, $$SHA)"; \
+	else \
+		cp build/$*/manifest.json "$$D/manifest.json"; cp build/$*/manifest.json.sig "$$D/manifest.json.sig"; \
+		PUB=$$(cat build/keys/release.pub.b64); \
+		printf '{\n  "_stage1": { "%s": { "ed25519": "%s", "manifest_url": %s } }\n}\n' \
+			"$*" "$$PUB" "$$MURL" > user-data.stage0.json; \
+		echo "Wrote user-data.stage0.json (signed manifest mode, release pubkey $$PUB)"; \
 	fi; \
 	$(STAGE0_QEMU) --kind stage0 --arch $* \
 		--boot-disk build/$*/boot.disk \
-		--user-data user-data.stage0.json --payload "$$P" $(if $(TRACE),--trace)
+		--user-data user-data.stage0.json --serve-dir "$$D" $(if $(TRACE),--trace)
 
 test-%:
 	$(MAKE) boot-$* TRACE=$(TRACE)

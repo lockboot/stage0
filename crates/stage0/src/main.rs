@@ -35,7 +35,7 @@ mod udp4;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use config::{UrlList, Verify};
+use config::{Manifest, UrlList, Verify};
 use sha2::{Digest, Sha256};
 use uefi::boot;
 use uefi::prelude::*;
@@ -81,7 +81,7 @@ fn run() -> Result<(), Status> {
 
     // Bring the network up once (DHCP), then fetch metadata. Metadata and payload
     // both ride the raw-TCP4 HTTP client (http.rs).
-    let (urls, verify, args) = {
+    let (verify, sha256_urls, inline_args) = {
         net::bringup()?;
 
         // An embedded `_stage1` section is part of the signed, measured PE, so it
@@ -106,13 +106,14 @@ fn run() -> Result<(), Status> {
             crate::slog!("stage0: invalid arch config: {m}");
             Status::INVALID_PARAMETER
         })?;
-        (arch.url.0.clone(), verify, user_data.stage1.args.clone())
+        // `url` is only used in sha256 mode; ed25519 mode carries its URLs in the manifest.
+        (verify, arch.url.clone(), user_data.stage1.args.clone())
     };
 
-    // Try each mirror URL in order until one downloads and admits. Content is pinned,
-    // so any mirror that yields verifying bytes is acceptable (fallback for resiliency).
-    // Signed remote load options (ed25519 mode), if any, override the inline `args`.
-    let (binary, digest, signed_args) = admit_payload(&urls, &verify)?;
+    // Admit the payload: sha256 mode downloads from the inline `url` and checks the pin;
+    // ed25519 mode fetches + verifies a signed manifest first, then admits by the hash it
+    // names. Any signed args (from the manifest) come back to override inline `args`.
+    let (binary, digest, signed_args) = admit_payload(&verify, sha256_urls.as_ref())?;
 
     // Measure before executing. Only PCR 14 (the binary): the config/key are not
     // measured, so attestation is simply "stage0 ran and loaded this hash".
@@ -134,10 +135,10 @@ fn run() -> Result<(), Status> {
         crate::slog!("stage0: load_image failed: {status:?}");
     })?;
 
-    // Load options: signed remote args (if any) override the inline `args`. The
+    // Load options: manifest args (ed25519 mode), if any, override the inline `args`. The
     // backing buffer must stay alive until after start_image.
     let opts = signed_args.or_else(|| {
-        args.as_deref().filter(|a| !a.is_empty()).map(|a| a.join(" "))
+        inline_args.as_deref().filter(|a| !a.is_empty()).map(|a| a.join(" "))
     });
     let _options = set_load_options(image, opts.as_deref());
 
@@ -176,14 +177,45 @@ fn download_first(urls: &[String]) -> Result<Vec<u8>, Status> {
     Err(last)
 }
 
-/// Try each payload URL until one downloads and admits (content is pinned, so any mirror
-/// that yields verifying bytes is acceptable). Returns the bytes, their SHA-256 digest,
-/// and any verified signed load options.
-fn admit_payload(urls: &[String], verify: &Verify) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+/// Admit the payload. sha256 mode downloads from the inline `url` and checks the pin; ed25519
+/// mode fetches + verifies a signed manifest, then admits the payload by the manifest's hash.
+/// Returns the bytes, their SHA-256 digest, and any signed load options (from the manifest).
+fn admit_payload(
+    verify: &Verify,
+    sha256_urls: Option<&UrlList>,
+) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+    match verify {
+        Verify::Sha256(expected) => {
+            // Static pin: the payload URL(s) come from the (trusted) user-data.
+            let urls = sha256_urls.ok_or(Status::INVALID_PARAMETER)?;
+            admit_by_hash(&urls.0, expected, None)
+        }
+        Verify::Ed25519 { pubkey, manifest_url, manifest_sig_url } => {
+            // Roll-forward: one signed manifest binds the payload hash + args under one key,
+            // so a hostile mirror can neither mix-and-match nor swap the payload.
+            let manifest = fetch_manifest(pubkey, manifest_url, manifest_sig_url.as_ref())?;
+            let urls = substitute(&manifest.url.0, &manifest.sha256);
+            let args = manifest
+                .args
+                .as_ref()
+                .filter(|a| !a.is_empty())
+                .map(|a| a.join(" "));
+            admit_by_hash(&urls, &manifest.sha256, args)
+        }
+    }
+}
+
+/// Try each mirror until one downloads and matches `expected_hex` (content is pinned, so any
+/// mirror yielding the right bytes is acceptable). Threads `args` (signed load options) through.
+fn admit_by_hash(
+    urls: &[String],
+    expected_hex: &str,
+    args: Option<String>,
+) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
     let mut last = Status::NOT_FOUND;
     for url in urls {
-        match admit_from(url, verify) {
-            Ok(result) => return Ok(result),
+        match download_verify(url, expected_hex) {
+            Ok((binary, digest)) => return Ok((binary, digest, args)),
             Err(s) => {
                 crate::slog!("stage0: payload url rejected: {url} ({s:?})");
                 last = s;
@@ -193,79 +225,77 @@ fn admit_payload(urls: &[String], verify: &Verify) -> Result<(Vec<u8>, [u8; 32],
     Err(last)
 }
 
-/// Download one payload candidate and run admission control (a gate — never measured).
-fn admit_from(url: &str, verify: &Verify) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+/// Download one payload candidate and check its SHA-256 against `expected_hex` (a gate — the
+/// hash itself is never measured; PCR 14 gets the loaded binary).
+fn download_verify(url: &str, expected_hex: &str) -> Result<(Vec<u8>, [u8; 32]), Status> {
     crate::sdbg!("stage0:   downloading payload from {url}");
     let binary = http::download(url)?;
     crate::slog!("stage0: payload: {} bytes from {url}", binary.len());
     let digest = sha256(&binary);
     let hash = hex::encode(digest);
-    let mut signed_args: Option<String> = None;
-    match verify {
-        Verify::Sha256(expected) => {
-            if !hash.eq_ignore_ascii_case(expected) {
-                crate::slog!("stage0: SHA256 mismatch! expected {expected}, got {hash}");
-                return Err(Status::SECURITY_VIOLATION);
-            }
-            crate::slog!("stage0: verified: sha256:{hash} (sha256 pin)");
-        }
-        Verify::Ed25519 { pubkey, sig_url, args_url, args_sig_url } => {
-            // Detached signature: the `sig_url` templates with `{sha256}` replaced by the
-            // payload digest (content-addressable), else `<url>.sig` (co-located per mirror).
-            let sig_urls = match sig_url {
-                Some(u) => substitute(&u.0, &hash),
-                None => alloc::vec![alloc::format!("{url}.sig")],
-            };
-            let signature = download_first(&sig_urls)?;
-            sig::verify(pubkey, &binary, &signature).map_err(|m| {
-                crate::slog!("stage0: ed25519 verification failed: {m}");
-                Status::SECURITY_VIOLATION
-            })?;
-            crate::slog!("stage0: verified: sha256:{hash} (ed25519 key:{pubkey})");
-            if let Some(au) = args_url {
-                signed_args = Some(fetch_signed_args(&au.0, args_sig_url.as_ref(), pubkey, &hash)?);
+    if !hash.eq_ignore_ascii_case(expected_hex) {
+        crate::slog!("stage0: SHA256 mismatch! expected {expected_hex}, got {hash}");
+        return Err(Status::SECURITY_VIOLATION);
+    }
+    crate::slog!("stage0: verified: sha256:{hash}");
+    Ok((binary, digest))
+}
+
+/// Fetch + verify the signed release manifest (ed25519 mode). Tries each `manifest_url` mirror;
+/// a candidate is accepted only if it downloads, its detached signature verifies against
+/// `pubkey`, and it parses as a valid [`Manifest`]. The signature comes from `manifest_sig_url`
+/// (with `{sha256}` replaced by the retrieved manifest's own digest), else `<manifest_url>.sig`.
+fn fetch_manifest(
+    pubkey: &str,
+    manifest_url: &UrlList,
+    manifest_sig_url: Option<&UrlList>,
+) -> Result<Manifest, Status> {
+    let mut last = Status::NOT_FOUND;
+    for murl in &manifest_url.0 {
+        match try_fetch_manifest(pubkey, murl, manifest_sig_url) {
+            Ok(m) => return Ok(m),
+            Err(s) => {
+                crate::slog!("stage0: manifest rejected: {murl} ({s:?})");
+                last = s;
             }
         }
     }
-    Ok((binary, digest, signed_args))
+    Err(last)
 }
 
-/// Fetch and verify signed load options (ed25519 mode). `args_url`/`args_sig_url` may
-/// contain `{sha256}` (replaced with the payload digest) and may each be a fallback list.
-/// The detached signature (from `args_sig_url`, else `<args_url>.sig`) must verify against
-/// the release `pubkey`; the verified bytes are returned verbatim (trimmed) as load options.
-fn fetch_signed_args(
-    args_urls: &[String],
-    args_sig_url: Option<&UrlList>,
+fn try_fetch_manifest(
     pubkey: &str,
-    payload_hash: &str,
-) -> Result<String, Status> {
-    let args_urls = substitute(args_urls, payload_hash);
-    let sig_urls = match args_sig_url {
-        Some(u) => substitute(&u.0, payload_hash),
-        None => args_urls.iter().map(|u| alloc::format!("{u}.sig")).collect(),
+    murl: &str,
+    manifest_sig_url: Option<&UrlList>,
+) -> Result<Manifest, Status> {
+    let bytes = http::download(murl)?;
+    let mhash = hex::encode(sha256(&bytes));
+    let sig_urls = match manifest_sig_url {
+        Some(u) => substitute(&u.0, &mhash),
+        None => alloc::vec![alloc::format!("{murl}.sig")],
     };
-    let args = download_first(&args_urls)?;
-    let sig = download_first(&sig_urls)?;
-    sig::verify(pubkey, &args, &sig).map_err(|m| {
-        crate::slog!("stage0: signed args verification failed: {m}");
+    let signature = download_first(&sig_urls)?;
+    sig::verify(pubkey, &bytes, &signature).map_err(|m| {
+        crate::slog!("stage0: manifest signature invalid: {m}");
         Status::SECURITY_VIOLATION
     })?;
-    let opts = core::str::from_utf8(&args)
-        .map_err(|_| {
-            crate::slog!("stage0: signed args are not valid UTF-8");
-            Status::INVALID_PARAMETER
-        })?
-        .trim();
-    crate::slog!("stage0: args: {} bytes signed (ed25519)", opts.len());
-    Ok(opts.into())
+    let manifest = Manifest::parse(&bytes).map_err(|m| {
+        crate::slog!("stage0: invalid manifest: {m}");
+        Status::INVALID_PARAMETER
+    })?;
+    crate::slog!(
+        "stage0: manifest verified (sha256:{}, version {}, key:{pubkey})",
+        manifest.sha256,
+        manifest.version
+    );
+    Ok(manifest)
 }
 
 /// Set the loaded image's load options from the final `opts` string (UCS-2).
 /// Returns the backing [`CString16`], which the caller must keep alive until
 /// `start_image`.
 ///
-/// `opts` is sourced only from the metadata `_stage1.args` or the signed `args_url`
+/// `opts` is sourced only from the metadata `_stage1.args` or the signed manifest's `args`
 /// (see `run`); stage0 never reads or forwards its own firmware/shell invocation
 /// arguments to the child. For a Linux UKI child these LoadOptions would be the kernel
 /// command line, but the UKI bakes + measures its own `.cmdline` and the stub ignores
