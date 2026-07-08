@@ -2,18 +2,18 @@
 
 //! The `_stage1` metadata schema.
 //!
-//! Mirrors `stage1`'s per-arch `{url, sha256}` structure (plus optional `args`)
-//! but under a distinct `_stage1` key, so a UEFI payload is never confused with
-//! a Linux `_stage2` binary in the same document.
+//! Mirrors `stage1`'s per-arch discriminated union but under a distinct `_stage1` key, so a UEFI
+//! payload is never confused with a Linux `_stage2` binary in the same document. Each arch entry
+//! is either a [`Payload`] (admit a UEFI binary now, by sha256 pin or ed25519-signed) or a
+//! [`ManifestRef`] (fetch a signed manifest — itself a `_stage1` fragment — and resolve it).
 //!
-//! `args` (and the signed `args_url`) set the booted EFI program's UEFI *LoadOptions* --
-//! the generic way stage0 parameterizes whatever EFI image it chain-loads. They are
-//! sourced ONLY from this metadata (or the signed URL); stage0 never forwards its own
-//! firmware/shell invocation arguments to stage1. For a Linux UKI stage1 specifically,
-//! the kernel command line is baked into the signed, measured UKI and is authoritative:
-//! under Secure Boot the stub ignores LoadOptions, so `_stage1.args` cannot alter the UKI
-//! cmdline (operator config for a UKI flows through `_stage2`, not the kernel cmdline).
-//! A non-UKI EFI stage1 is free to read these LoadOptions as its arguments.
+//! `args` (and the signed `args_url`) set the booted EFI program's UEFI *LoadOptions* -- the
+//! generic way stage0 parameterizes whatever EFI image it chain-loads. They are sourced ONLY from
+//! this metadata (or the signed URL / manifest); stage0 never forwards its own firmware/shell
+//! invocation arguments to stage1. For a Linux UKI stage1 specifically, the kernel command line is
+//! baked into the signed, measured UKI and is authoritative: under Secure Boot the stub ignores
+//! LoadOptions, so `args` cannot alter the UKI cmdline (operator config for a UKI flows through
+//! `_stage2`). A non-UKI EFI stage1 is free to read these LoadOptions as its arguments.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -50,11 +50,6 @@ pub struct UserData {
 
 #[derive(Debug, Deserialize)]
 pub struct Stage1Config {
-    /// Inline UEFI LoadOptions for the booted stage1 EFI image (a non-UKI stage1 reads
-    /// these as its args). Overridden by the signed `args_url`. See the module docs for
-    /// how a Linux UKI treats these (baked cmdline wins; ignored under Secure Boot).
-    #[serde(default)]
-    pub args: Option<Vec<String>>,
     // Exactly one of these is read per build (see `for_this_arch`); the other
     // is still deserialized so a single multi-arch document works everywhere.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
@@ -65,43 +60,75 @@ pub struct Stage1Config {
     pub x86_64: Option<ArchConfig>,
 }
 
+/// One architecture's admission entry: the discriminated union ([`Entry`]) plus the resolution
+/// history accumulated by the manifest loop (used only for cycle detection — stage0 forwards no
+/// doc, so the history is not surfaced anywhere).
 #[derive(Debug, Deserialize)]
 pub struct ArchConfig {
+    #[serde(flatten)]
+    pub entry: Entry,
+    // Deserialized so a merged manifest fragment carrying this key round-trips, but stage0 never
+    // reads it: it forwards no document (the UKI re-fetches its own metadata) and detects cycles
+    // with a loop-local record. stage1 is where this history is surfaced (into the stdin doc).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub resolved_manifests: Vec<ManifestRef>,
+}
+
+/// The per-arch discriminated union: a concrete payload to admit, or a signed manifest to resolve.
+#[derive(Debug, Deserialize)]
+pub enum Entry {
+    #[serde(rename = "payload")]
+    Payload(Payload),
+    #[serde(rename = "manifest")]
+    Manifest(ManifestRef),
+}
+
+/// A concrete payload admission. Exactly one of `sha256` (pin an exact hash) or `ed25519` (pin a
+/// long-term release pubkey; the payload rolls forward gated by a detached `.sig`) selects the mode.
+#[derive(Debug, Deserialize)]
+pub struct Payload {
     pub url: UrlList,
-    // Exactly one of these selects the verification mode (see `verify`):
-    //   sha256  → pin an exact hash (immutable payload).
-    //   ed25519 → pin a long-term release pubkey (base64); the payload may roll
-    //             forward without editing metadata, gated by a detached `.sig`.
     #[serde(default)]
     pub sha256: Option<String>,
     #[serde(default)]
     pub ed25519: Option<String>,
-    /// Where the detached ed25519 signature lives (signed mode). Any `{sha256}`
-    /// is replaced with the payload's hex digest, so the signature can be
-    /// content-addressed. Defaults to `<url>.sig` when omitted. String or list.
+    /// Where the detached ed25519 signature lives (signed mode). `{sha256}` → payload digest.
+    /// Defaults to `<url>.sig`. String or list.
     #[serde(default)]
     pub sig_url: Option<UrlList>,
-    /// Optional signed load options (ed25519 mode only). The args are fetched from
-    /// `args_url` (with `{sha256}` substituted), and their detached signature from
-    /// `args_sig_url` (with `{sha256}` substituted), or `<args_url>.sig` when that
-    /// is omitted. The signature is verified against the same release key as the
-    /// payload; the verified bytes are used verbatim as the payload's UEFI load
-    /// options, overriding inline `args`. String or list.
+    /// Inline UEFI LoadOptions (overridden by a verified `args_url`).
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    /// Optional signed load options (ed25519 mode only): fetched from `args_url` (`{sha256}`
+    /// substituted), verified against the same release key via `args_sig_url` (else `<args_url>.sig`),
+    /// used verbatim as the payload's LoadOptions, overriding inline `args`. String or list.
     #[serde(default)]
     pub args_url: Option<UrlList>,
     #[serde(default)]
     pub args_sig_url: Option<UrlList>,
 }
 
-/// How stage0 admits the downloaded payload before measuring + loading it.
-pub enum Verify {
+/// A pointer to a signed manifest (also a resolution-history record). The manifest is fetched from
+/// `url`, its detached signature (`sig_url`, else `<url>.sig`) verified against the pinned `ed25519`
+/// key, then deep-merged and re-evaluated. `sha256` optionally pins the manifest's own bytes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManifestRef {
+    pub url: UrlList,
+    pub ed25519: String,
+    #[serde(default)]
+    pub sig_url: Option<UrlList>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// How stage0 admits a downloaded payload before measuring + loading it.
+pub enum Admit {
     /// Payload's SHA-256 must equal this 64-hex string.
     Sha256(String),
-    /// Detached ed25519 signature must verify against this base64-encoded 32-byte
-    /// release public key. `sig_url` is where the payload signature is fetched from
-    /// (or `None` to default to `<url>.sig`). `args_url`/`args_sig_url` optionally
-    /// add signed load options verified against the same key. All `*_url` values
-    /// still carry an unsubstituted `{sha256}`; the caller substitutes it.
+    /// Detached ed25519 signature must verify against this base64 32-byte release key. `sig_url`
+    /// is where the payload signature is fetched (or `None` → `<url>.sig`); `args_url`/`args_sig_url`
+    /// optionally add signed load options. All `*_url` values still carry an unsubstituted `{sha256}`.
     Ed25519 {
         pubkey: String,
         sig_url: Option<UrlList>,
@@ -129,16 +156,29 @@ impl Stage1Config {
     }
 }
 
-impl ArchConfig {
-    /// Validate the URL and the (single) verification field, returning the
-    /// selected [`Verify`] mode.
-    pub fn validate(&self) -> Result<Verify, &'static str> {
-        // http:// only: stage0's TCP4 client speaks plain HTTP, TLS is not used
-        // (integrity comes from the pin/signature, not the transport). Rejecting
-        // https:// here turns an unfetchable URL into a clear config-time error
-        // rather than a late download failure. Each field is a URL or a fallback list.
-        let ok_url = |s: &str| s.starts_with("http://") && s.chars().all(|c| c.is_ascii_graphic());
-        let ok_list = |l: &UrlList| !l.0.is_empty() && l.0.iter().all(|s| ok_url(s));
+// http:// only: stage0's TCP4 client speaks plain HTTP, TLS is not used (integrity comes from the
+// pin/signature, not the transport). Rejecting https:// turns an unfetchable URL into a clear
+// config-time error rather than a late download failure.
+fn ok_url(s: &str) -> bool {
+    s.starts_with("http://") && s.chars().all(|c| c.is_ascii_graphic())
+}
+fn ok_list(l: &UrlList) -> bool {
+    !l.0.is_empty() && l.0.iter().all(|s| ok_url(s))
+}
+fn ok_sha256(hex: &str) -> bool {
+    hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+fn ok_pubkey(s: &str) -> Result<(), &'static str> {
+    match STANDARD.decode(s.trim()) {
+        Ok(bytes) if bytes.len() == 32 => Ok(()),
+        Ok(_) => Err("ed25519 pubkey must decode to 32 bytes"),
+        Err(_) => Err("ed25519 pubkey must be base64"),
+    }
+}
+
+impl Payload {
+    /// Validate the URL(s) + the (single) verification field, returning the selected [`Admit`] mode.
+    pub fn admission(&self) -> Result<Admit, &'static str> {
         if !ok_list(&self.url) {
             return Err("url must be a non-empty http:// URL (or list of them), printable ASCII (TLS unsupported)");
         }
@@ -156,31 +196,42 @@ impl ArchConfig {
         }
         match (&self.sha256, &self.ed25519) {
             (Some(_), Some(_)) => Err("specify only one of sha256 / ed25519"),
-            (None, None) => Err("must specify one of sha256 / ed25519"),
+            (None, None) => Err("payload must specify one of sha256 / ed25519"),
             (Some(hex), None) => {
-                // Signed args need the release key, which only signed mode pins.
                 if self.args_url.is_some() {
                     return Err("args_url requires ed25519 signed mode");
                 }
-                if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                if !ok_sha256(hex) {
                     return Err("sha256 must be exactly 64 hex characters");
                 }
-                Ok(Verify::Sha256(hex.clone()))
+                Ok(Admit::Sha256(hex.clone()))
             }
             (None, Some(pubkey)) => {
-                // A raw ed25519 public key is 32 bytes.
-                match STANDARD.decode(pubkey.trim()) {
-                    Ok(bytes) if bytes.len() == 32 => Ok(Verify::Ed25519 {
-                        pubkey: pubkey.clone(),
-                        sig_url: self.sig_url.clone(),
-                        args_url: self.args_url.clone(),
-                        args_sig_url: self.args_sig_url.clone(),
-                    }),
-                    Ok(_) => Err("ed25519 pubkey must decode to 32 bytes"),
-                    Err(_) => Err("ed25519 pubkey must be base64"),
-                }
+                ok_pubkey(pubkey)?;
+                Ok(Admit::Ed25519 {
+                    pubkey: pubkey.clone(),
+                    sig_url: self.sig_url.clone(),
+                    args_url: self.args_url.clone(),
+                    args_sig_url: self.args_sig_url.clone(),
+                })
             }
         }
+    }
+}
+
+impl ManifestRef {
+    /// Validate the manifest pointer (http-only).
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !ok_list(&self.url) {
+            return Err("manifest url must be a non-empty http:// URL (or list), printable ASCII");
+        }
+        if self.sig_url.as_ref().is_some_and(|l| !ok_list(l)) {
+            return Err("manifest sig_url must be http:// URL(s), printable ASCII");
+        }
+        if self.sha256.as_ref().is_some_and(|h| !ok_sha256(h)) {
+            return Err("manifest sha256 must be exactly 64 hex characters");
+        }
+        ok_pubkey(&self.ed25519)
     }
 }
 
