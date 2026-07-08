@@ -20,46 +20,75 @@ it at your payload with a `_stage1` user-data document:
 ```json
 {
    "_stage1": {
-      "x86_64": {
-         "url": "http://cdn.example.com/app.efi",
-         "sha256": "<64-hex sha256>"
-      },
-      "aarch64": {
+      "x86_64":  { "payload": { "url": "http://cdn.example.com/app.efi", "sha256": "<64-hex sha256>" } },
+      "aarch64": { "payload": {
          "url": "http://cdn.example.com/app.efi",
          "ed25519": "<base64 pubkey>",
-         "args_url": "http://cdn.example.com/app.args",  // optional
-      }
+         "args_url": "http://cdn.example.com/app.args"
+      } }
    }
 }
 ```
 
-Per arch, pick the admission mode:
+Each arch entry is a discriminated union — exactly one of a `payload` (admit a
+binary now) or a `manifest` (resolve a signed manifest first):
 
-- **`sha256`**: pin an exact hash. Immutable; re-pin for every build.
-- **`ed25519`**: pin a long-term release public key. The payload rolls forward
-  without editing metadata: sign each build offline and serve the detached
+- **`payload` / `sha256`**: pin an exact hash. Immutable; re-pin for every build.
+- **`payload` / `ed25519`**: pin a long-term release public key. The payload rolls
+  forward without editing metadata: sign each build offline and serve the detached
   signature at `<url>.sig`, or at a `sig_url` of your choice. A `{sha256}` in
   `sig_url` is replaced with the payload's hash, so signatures can be
   content-addressed (e.g. `http://cdn.example.com/sigs/{sha256}.sig`).
+- **`manifest`**: pin a release key **and** a manifest URL. stage0 fetches the signed
+  manifest (a `_stage1` fragment), verifies its detached signature (`<url>.sig`, or
+  `sig_url`) against the pinned `ed25519` key, deep-merges it, and re-evaluates —
+  looping through a chain of signed manifests (per-hop key delegation) until it
+  reaches a payload; a repeated `(url, sha256)` is a cycle and fails closed. Binding
+  the payload + args under one manifest signature stops mix-and-match of independently
+  signed pieces. Optional `manifest.sha256` also pins the manifest's own bytes.
+
+  ```json
+  { "_stage1": { "x86_64": { "manifest": { "url": "http://cdn.example.com/app.manifest.json", "ed25519": "<base64 pubkey>" } } } }
+  ```
 
 The payload must be a UEFI PE. However the firmware `db` feels about it, stage0
 admits it by your pin/signature and measures it into **PCR 14** (= its SHA-256).
 
+## Testing
+
+`make boot` builds the `db`-signed boot disk and boots it under QEMU, serving a small test
+payload that reads the PCRs and prints them. Pick a mode with `SIGN=1` (ed25519), `SIGN_ARGS=1`
+(signed LoadOptions), `MANIFEST=1` (resolve a signed `_stage1` manifest), `FALLBACK=1` (mirror
+fallback), or `ARGS='[…]'` (inline LoadOptions).
+
+`make smoke-boot` runs the whole matrix as an **asserting** suite — each admission mode boots
+`stage0 → test-payload` and verifies the payload actually chain-loaded (proving fetch → admit →
+PCR-measure → chain-load), printing a per-mode PASS/FAIL summary. It needs nested KVM (local only)
+and takes ~2 minutes. Everything is regenerated and signed reproducibly from the Makefile — no
+manual steps.
+
+Under the test harness the payload runs with `--nosleep` in its LoadOptions (skipping its
+EC2-only ~60s serial-flush hold, which QEMU doesn't need) and powers the machine off at the end
+instead of returning to stage0 — so each boot exits promptly. A real EC2 deploy passes no such
+flag and keeps the full drain; nothing is gated behind a separate build.
+
 ## `_stage1` metadata reference
 
-A `_stage1` object with an optional `args` and one entry per architecture. Each
-arch entry needs `url` **and exactly one** of `sha256` or `ed25519`.
+A `_stage1` object with one entry per architecture; the running arch's must be present.
+Each arch entry is `{ "payload": {…} }` (needs `url` **and exactly one** of `sha256` /
+`ed25519`) or `{ "manifest": {…} }` (needs `url` + `ed25519`).
 
 | Field | In | Type | Rules |
 |---|---|---|---|
-| `args` | `_stage1` | `string[]` | optional; passed to the payload as UEFI load options |
-| `x86_64` / `aarch64` | `_stage1` | object | per-arch entry; the running arch's must be present |
-| `url` | arch entry | `string` | `http://…`, printable ASCII (TLS is not used) |
-| `sha256` | arch entry | `string` | exactly 64 hex characters |
-| `ed25519` | arch entry | `string` | base64 of a 32-byte public key |
-| `sig_url` | arch entry | `string` | optional (signed mode); payload signature location, `{sha256}` → payload hash. Defaults to `<url>.sig` |
-| `args_url` | arch entry | `string` | optional (signed mode only); fetch signed load options here, `{sha256}` → payload hash. Overrides inline `args` |
-| `args_sig_url` | arch entry | `string` | optional; signature for `args_url`, `{sha256}` → payload hash. Defaults to `<args_url>.sig`. Requires `args_url` |
+| `x86_64` / `aarch64` | `_stage1` | object | per-arch union entry; the running arch's must be present |
+| `url` | payload / manifest | `string`/list | `http://…`, printable ASCII (TLS is not used) |
+| `sha256` | payload | `string` | exactly 64 hex characters |
+| `ed25519` | payload / manifest | `string` | base64 of a 32-byte public key |
+| `sig_url` | payload / manifest | `string`/list | optional (signed mode); signature location, `{sha256}` → payload/manifest hash. Defaults to `<url>.sig` |
+| `args` | payload | `string[]` | optional inline UEFI load options |
+| `args_url` | payload | `string`/list | optional (signed mode only); fetch signed load options here, `{sha256}` → payload hash. Overrides inline `args` |
+| `args_sig_url` | payload | `string`/list | optional; signature for `args_url`, `{sha256}` → payload hash. Defaults to `<args_url>.sig`. Requires `args_url` |
+| `sha256` | manifest | `string` | optional; pins the manifest's own bytes (64 hex) |
 
 `args_url` content is verified against `ed25519` (the same release key as the
 payload) and used verbatim, trimmed, as the load-options string.

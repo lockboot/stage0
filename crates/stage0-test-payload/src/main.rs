@@ -21,6 +21,8 @@ use anyhow::{anyhow, bail, Result};
 use uefi::boot::{self, ScopedProtocol};
 use uefi::prelude::*;
 use uefi::println;
+use uefi::runtime::{self, ResetType};
+use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::tcg::v2::Tcg;
 use vaportpm_attest::{PcrOps, TpmTransport};
 
@@ -57,18 +59,38 @@ fn main() -> Status {
         Err(e) => println!("payload: could not read PCRs: {e}"),
     }
 
-    // EC2's serial console buffer is only flushed periodically; if the payload
-    // returns immediately, stage0 falls through, the VM resets/terminates, and the
-    // PCR dump above never makes it out. Hold ~60s before handing back, with a
-    // heartbeat so it is visibly alive and the console keeps draining.
-    println!("payload: holding ~60s so the serial console drains...");
-    for i in 1..=6 {
-        boot::stall(10_000_000); // 10s
-        println!("payload: drain {i}/6 (~{}s)", i * 10);
+    // EC2's serial console buffer is only flushed periodically; if the payload terminates
+    // immediately the PCR dump above never makes it out. Hold ~60s with a heartbeat so it is
+    // visibly alive and the console keeps flushing -- skipped when LoadOptions carry `--nosleep`
+    // (the QEMU test harness passes it, since it captures serial live and has no such lag).
+    if !load_options_contains("--nosleep") {
+        println!("payload: holding ~60s so the serial console flushes...");
+        for i in 1..=6 {
+            boot::stall(10_000_000); // 10s
+            println!("payload: flush {i}/6 (~{}s)", i * 10);
+        }
     }
 
     println!("payload: done");
-    Status::SUCCESS
+    // A test payload never boots an OS, so it never needs to hand control back to stage0. Power
+    // off cleanly instead of returning: a return makes stage0 treat it as an unexpected
+    // fall-through and run its own (~90s) fail-closed drain, needlessly slowing the boot.
+    runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None)
+}
+
+/// True if this image's UEFI LoadOptions (set by stage0 from `_stage1.args` / a signed manifest)
+/// contain the ASCII `flag`. Lets the QEMU test harness (`--nosleep`) skip the EC2-only
+/// serial-flush hold. LoadOptions are UCS-2, so an ASCII flag encodes as each byte followed by
+/// `0x00`; we scan the raw bytes for that needle (avoids any CStr16 decode/normalisation).
+fn load_options_contains(flag: &str) -> bool {
+    let Ok(li) = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()) else {
+        return false;
+    };
+    let Some(bytes) = li.load_options_as_bytes() else {
+        return false;
+    };
+    let needle: Vec<u8> = flag.bytes().flat_map(|b| [b, 0]).collect();
+    bytes.windows(needle.len()).any(|w| w == needle.as_slice())
 }
 
 fn print_pcrs() -> Result<()> {

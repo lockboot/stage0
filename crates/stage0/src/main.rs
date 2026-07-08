@@ -35,7 +35,8 @@ mod udp4;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use config::{UrlList, Verify};
+use config::{Admit, ArchConfig, Entry, ManifestRef, UrlList};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uefi::boot;
 use uefi::prelude::*;
@@ -81,7 +82,7 @@ fn run() -> Result<(), Status> {
 
     // Bring the network up once (DHCP), then fetch metadata. Metadata and payload
     // both ride the raw-TCP4 HTTP client (http.rs).
-    let (urls, verify, args) = {
+    let (binary, digest, opts) = {
         net::bringup()?;
 
         // An embedded `_stage1` section is part of the signed, measured PE, so it
@@ -94,25 +95,11 @@ fn run() -> Result<(), Status> {
             }
             None => metadata::fetch()?,
         };
-        let user_data = config::parse(&json).map_err(|m| {
-            crate::slog!("stage0: config error: {m}");
-            Status::INVALID_PARAMETER
-        })?;
-        let arch = user_data.stage1.for_this_arch().ok_or_else(|| {
-            crate::slog!("stage0: no _stage1 config for this architecture");
-            Status::UNSUPPORTED
-        })?;
-        let verify = arch.validate().map_err(|m| {
-            crate::slog!("stage0: invalid arch config: {m}");
-            Status::INVALID_PARAMETER
-        })?;
-        (arch.url.0.clone(), verify, user_data.stage1.args.clone())
+        // Resolve `_stage1.<arch>`: admit a payload directly, or follow a chain of signed
+        // manifests (each deep-merged into the doc and re-evaluated) until a payload is reached.
+        // Returns the admitted binary, its digest, and the load options (signed args, else inline).
+        resolve_payload(&json)?
     };
-
-    // Try each mirror URL in order until one downloads and admits. Content is pinned,
-    // so any mirror that yields verifying bytes is acceptable (fallback for resiliency).
-    // Signed remote load options (ed25519 mode), if any, override the inline `args`.
-    let (binary, digest, signed_args) = admit_payload(&urls, &verify)?;
 
     // Measure before executing. Only PCR 14 (the binary): the config/key are not
     // measured, so attestation is simply "stage0 ran and loaded this hash".
@@ -134,11 +121,8 @@ fn run() -> Result<(), Status> {
         crate::slog!("stage0: load_image failed: {status:?}");
     })?;
 
-    // Load options: signed remote args (if any) override the inline `args`. The
-    // backing buffer must stay alive until after start_image.
-    let opts = signed_args.or_else(|| {
-        args.as_deref().filter(|a| !a.is_empty()).map(|a| a.join(" "))
-    });
+    // Load options were resolved above (signed args override inline). The backing buffer
+    // must stay alive until after start_image.
     let _options = set_load_options(image, opts.as_deref());
 
     crate::slog!("stage0: starting payload");
@@ -176,13 +160,150 @@ fn download_first(urls: &[String]) -> Result<Vec<u8>, Status> {
     Err(last)
 }
 
+/// Resolve `_stage1.<arch>` to a concrete payload and admit it. The entry is a discriminated union:
+/// a `payload` is admitted directly (sha256 pin or ed25519-signed); a `manifest` is fetched, verified
+/// against its pinned key, deep-merged into the doc, and the merged entry re-evaluated — a loop that
+/// follows a chain of signed manifests (per-hop key delegation) until it reaches a payload. A repeated
+/// (url,hash) is a cycle and fails closed. stage0 forwards no document (the UKI re-fetches its own
+/// metadata), so the merged doc drives only re-evaluation. Returns the admitted binary, its digest,
+/// and the load options (signed args, else inline `args` joined by spaces).
+fn resolve_payload(json: &[u8]) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+    // Validate the document up front (clear error) + confirm this arch is present, then drive
+    // resolution off a Value so a signed manifest fragment can be deep-merged and re-evaluated.
+    let ud = config::parse(json).map_err(|m| {
+        crate::slog!("stage0: config error: {m}");
+        Status::INVALID_PARAMETER
+    })?;
+    ud.stage1.for_this_arch().ok_or_else(|| {
+        crate::slog!("stage0: no _stage1 config for this architecture");
+        Status::UNSUPPORTED
+    })?;
+    let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+    let mut doc: Value = serde_json::from_slice(json).map_err(|_| Status::INVALID_PARAMETER)?;
+    let mut history: Vec<ManifestRef> = Vec::new();
+
+    loop {
+        let entry_val = doc
+            .get("_stage1")
+            .and_then(|s| s.get(arch))
+            .ok_or_else(|| {
+                crate::slog!("stage0: no _stage1 config for this architecture");
+                Status::UNSUPPORTED
+            })?;
+        let ac: ArchConfig = serde_json::from_value(entry_val.clone()).map_err(|_| {
+            crate::slog!("stage0: invalid _stage1 entry");
+            Status::INVALID_PARAMETER
+        })?;
+
+        match ac.entry {
+            Entry::Payload(p) => {
+                let mode = p.admission().map_err(|m| {
+                    crate::slog!("stage0: invalid _stage1 payload: {m}");
+                    Status::INVALID_PARAMETER
+                })?;
+                let (binary, digest, signed_args) = admit_payload(&p.url.0, &mode)?;
+                let opts = signed_args.or_else(|| {
+                    p.args.as_deref().filter(|a| !a.is_empty()).map(|a| a.join(" "))
+                });
+                return Ok((binary, digest, opts));
+            }
+            Entry::Manifest(m) => {
+                m.validate().map_err(|e| {
+                    crate::slog!("stage0: invalid _stage1 manifest: {e}");
+                    Status::INVALID_PARAMETER
+                })?;
+                let (murl, bytes, hash) = fetch_manifest(&m)?;
+                if history
+                    .iter()
+                    .any(|r| r.sha256.as_deref() == Some(hash.as_str()) && r.url.0 == [murl.clone()])
+                {
+                    crate::slog!("stage0: manifest resolution cycle at {murl}");
+                    return Err(Status::SECURITY_VIOLATION);
+                }
+                history.push(ManifestRef {
+                    url: UrlList(alloc::vec![murl]),
+                    ed25519: m.ed25519.clone(),
+                    sig_url: m.sig_url.clone(),
+                    sha256: Some(hash),
+                });
+                // Consume the pointer, then deep-merge the manifest fragment (manifest wins). The
+                // merged entry re-populates with a `payload` (stop) or a fresh `manifest` (delegate).
+                if let Some(e) = doc.get_mut("_stage1").and_then(|s| s.get_mut(arch)).and_then(Value::as_object_mut) {
+                    e.remove("manifest");
+                }
+                let manifest_doc: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                    crate::slog!("stage0: manifest is not valid JSON");
+                    Status::INVALID_PARAMETER
+                })?;
+                deep_merge(&mut doc, &manifest_doc);
+            }
+        }
+    }
+}
+
+/// Fetch a signed manifest (mirror fallback) and verify its detached signature against the pinned
+/// key. Returns the serving URL, the verified bytes, and their hex sha256.
+fn fetch_manifest(m: &ManifestRef) -> Result<(String, Vec<u8>, String), Status> {
+    let mut last = Status::NOT_FOUND;
+    for url in &m.url.0 {
+        match try_fetch_manifest(m, url) {
+            Ok((bytes, hash)) => return Ok((url.clone(), bytes, hash)),
+            Err(s) => {
+                crate::slog!("stage0: manifest rejected: {url} ({s:?})");
+                last = s;
+            }
+        }
+    }
+    Err(last)
+}
+
+fn try_fetch_manifest(m: &ManifestRef, url: &str) -> Result<(Vec<u8>, String), Status> {
+    let bytes = http::download(url)?;
+    let hash = hex::encode(sha256(&bytes));
+    if let Some(pin) = &m.sha256 {
+        if !pin.eq_ignore_ascii_case(&hash) {
+            crate::slog!("stage0: manifest sha256 mismatch: expected {pin}, got {hash}");
+            return Err(Status::SECURITY_VIOLATION);
+        }
+    }
+    let sig_urls = match &m.sig_url {
+        Some(u) => substitute(&u.0, &hash),
+        None => alloc::vec![alloc::format!("{url}.sig")],
+    };
+    let signature = download_first(&sig_urls)?;
+    sig::verify(&m.ed25519, &bytes, &signature).map_err(|e| {
+        crate::slog!("stage0: manifest verification failed: {e}");
+        Status::SECURITY_VIOLATION
+    })?;
+    crate::slog!("stage0: manifest verified: sha256:{hash} (ed25519 key:{})", m.ed25519);
+    Ok((bytes, hash))
+}
+
+/// Recursively merge `overlay` into `base`: two objects merge key-by-key (recursing on shared keys);
+/// anything else takes `overlay`. `overlay` (the signed manifest) wins on every conflict.
+fn deep_merge(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(b), Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(k) {
+                    Some(existing) => deep_merge(existing, v),
+                    None => {
+                        b.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o.clone(),
+    }
+}
+
 /// Try each payload URL until one downloads and admits (content is pinned, so any mirror
 /// that yields verifying bytes is acceptable). Returns the bytes, their SHA-256 digest,
 /// and any verified signed load options.
-fn admit_payload(urls: &[String], verify: &Verify) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+fn admit_payload(urls: &[String], mode: &Admit) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
     let mut last = Status::NOT_FOUND;
     for url in urls {
-        match admit_from(url, verify) {
+        match admit_from(url, mode) {
             Ok(result) => return Ok(result),
             Err(s) => {
                 crate::slog!("stage0: payload url rejected: {url} ({s:?})");
@@ -194,22 +315,22 @@ fn admit_payload(urls: &[String], verify: &Verify) -> Result<(Vec<u8>, [u8; 32],
 }
 
 /// Download one payload candidate and run admission control (a gate — never measured).
-fn admit_from(url: &str, verify: &Verify) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+fn admit_from(url: &str, mode: &Admit) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
     crate::sdbg!("stage0:   downloading payload from {url}");
     let binary = http::download(url)?;
     crate::slog!("stage0: payload: {} bytes from {url}", binary.len());
     let digest = sha256(&binary);
     let hash = hex::encode(digest);
     let mut signed_args: Option<String> = None;
-    match verify {
-        Verify::Sha256(expected) => {
+    match mode {
+        Admit::Sha256(expected) => {
             if !hash.eq_ignore_ascii_case(expected) {
                 crate::slog!("stage0: SHA256 mismatch! expected {expected}, got {hash}");
                 return Err(Status::SECURITY_VIOLATION);
             }
             crate::slog!("stage0: verified: sha256:{hash} (sha256 pin)");
         }
-        Verify::Ed25519 { pubkey, sig_url, args_url, args_sig_url } => {
+        Admit::Ed25519 { pubkey, sig_url, args_url, args_sig_url } => {
             // Detached signature: the `sig_url` templates with `{sha256}` replaced by the
             // payload digest (content-addressable), else `<url>.sig` (co-located per mirror).
             let sig_urls = match sig_url {
