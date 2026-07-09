@@ -303,7 +303,7 @@ fn try_fetch_manifest(m: &ManifestRef, url: &str) -> Result<(Vec<u8>, String), S
         None => alloc::vec![alloc::format!("{url}.sig")],
     };
     let signature = download_first(&sig_urls)?;
-    sig::verify(&m.ed25519, &bytes, &signature).map_err(|e| {
+    sig::verify(&m.ed25519, sig::Domain::Stage1Manifest, &bytes, &signature).map_err(|e| {
         crate::slog!("stage0: manifest verification failed: {e}");
         Status::SECURITY_VIOLATION
     })?;
@@ -370,7 +370,7 @@ fn admit_from(url: &str, mode: &Admit) -> Result<(Vec<u8>, [u8; 32], Option<Stri
                 None => alloc::vec![alloc::format!("{url}.sig")],
             };
             let signature = download_first(&sig_urls)?;
-            sig::verify(pubkey, &binary, &signature).map_err(|m| {
+            sig::verify(pubkey, sig::Domain::Stage1Uki, &binary, &signature).map_err(|m| {
                 crate::slog!("stage0: ed25519 verification failed: {m}");
                 Status::SECURITY_VIOLATION
             })?;
@@ -400,7 +400,7 @@ fn fetch_signed_args(
     };
     let args = download_first(&args_urls)?;
     let sig = download_first(&sig_urls)?;
-    sig::verify(pubkey, &args, &sig).map_err(|m| {
+    sig::verify(pubkey, sig::Domain::Stage1Args, &args, &sig).map_err(|m| {
         crate::slog!("stage0: signed args verification failed: {m}");
         Status::SECURITY_VIOLATION
     })?;

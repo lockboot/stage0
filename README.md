@@ -51,6 +51,14 @@ binary now) or a `manifest` (resolve a signed manifest first):
   { "_stage1": { "x86_64": { "manifest": { "url": "http://cdn.example.com/app.manifest.json", "ed25519": "<base64 pubkey>" } } } }
   ```
 
+Signatures are **domain-separated**: every ed25519 signature is over a fixed 64-byte preimage
+`sha256(domain_tag) || sha256(message)`, where the tag names the exact role — `lockboot.v1.stage1.uki`
+for the payload, `lockboot.v1.stage1.args` for signed LoadOptions, `lockboot.v1.stage1.manifest` for a
+manifest. A signature minted for one role is structurally invalid in another, so a signed-args blob can
+never be replayed as a payload signature, nor a `_stage1` manifest as anything else. stage0 admits only
+these three `stage1.*` roles; the signer is `crates/stage0-sign` in this repo, whose framing is pinned
+byte-for-byte to stage1's `deploy` by a shared golden known-answer test.
+
 The payload must be a UEFI PE. However the firmware `db` feels about it, stage0
 admits it by your pin/signature and measures it into **PCR 14** (= its SHA-256).
 
@@ -65,7 +73,9 @@ fallback), or `ARGS='[…]'` (inline LoadOptions).
 `stage0 → test-payload` and verifies the payload actually chain-loaded (proving fetch → admit →
 PCR-measure → chain-load), printing a per-mode PASS/FAIL summary. It needs nested KVM (local only)
 and takes ~2 minutes. Everything is regenerated and signed reproducibly from the Makefile — no
-manual steps.
+manual steps. The release key and every detached signature are produced by `stage0-sign` (this
+repo's host-side signer: `make sign-bin`, or `make sign-test` for its golden vector), not `openssl`,
+so the test path dogfoods the same domain-separated signing a deployer would use.
 
 Under the test harness the payload runs with `--nosleep` in its LoadOptions (skipping its
 EC2-only ~60s serial-flush hold, which QEMU doesn't need) and powers the machine off at the end
