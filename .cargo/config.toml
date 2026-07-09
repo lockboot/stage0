@@ -1,9 +1,7 @@
 # Per-target rustc flags for stage0. Self-contained: CI checks this repo out ALONE (no workspace
 # parent, CARGO_HOME redirected to an empty dir), so the flags a build needs must live here, not in
-# the workspace-level config. These are expressed per target rather than as a single global RUSTFLAGS
-# in Dockerfile.build because a global RUSTFLAGS applies to EVERY target uniformly -- including the
-# host, where forcing `+crt-static` makes proc-macro dylibs impossible to build -- and it overrides
-# (never merges with) config rustflags. The per-target split below is what a single env var can't do.
+# the workspace-level config. Per target (not one flag set for all) because +crt-static must reach
+# the musl/uefi targets but not the host, where it makes proc-macro dylibs impossible to build.
 #
 # The UEFI flags reproduce the measured binaries byte-for-byte (stage0.efi, ena.efi, test-payload);
 # do not change them without re-pinning PCR4/PCR14 expectations. No `[build] target`: every stage0

@@ -17,7 +17,7 @@ use ed25519_compact::{KeyPair, Seed};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// A signing context — the `_stage1.*` roles stage0 admits. `tag()` must match stage1's namespace.
+/// A signing context — the `stage1.*` roles stage0 admits. `tag()` must match stage1's namespace.
 #[derive(Clone, Copy)]
 enum Domain {
     Stage1Uki,

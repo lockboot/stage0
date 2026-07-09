@@ -21,7 +21,7 @@ use base64::Engine as _;
 use ed25519_compact::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
 
-/// A signing context — the domain-separation namespace. stage0 admits only the `_stage1.*` roles.
+/// A signing context — the domain-separation namespace. stage0 admits only the `stage1.*` roles.
 /// Wire constants; must match the signer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Domain {

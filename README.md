@@ -74,8 +74,8 @@ fallback), or `ARGS='[…]'` (inline LoadOptions).
 PCR-measure → chain-load), printing a per-mode PASS/FAIL summary. It needs nested KVM (local only)
 and takes ~2 minutes. Everything is regenerated and signed reproducibly from the Makefile — no
 manual steps. The release key and every detached signature are produced by `stage0-sign` (this
-repo's host-side signer: `make sign-bin`, or `make sign-test` for its golden vector), not `openssl`,
-so the test path dogfoods the same domain-separated signing a deployer would use.
+repo's host-side signer: `make sign-bin`, or `make sign-test` for its golden vector), so the test
+path dogfoods the same domain-separated signing a deployer would use.
 
 Under the test harness the payload runs with `--nosleep` in its LoadOptions (skipping its
 EC2-only ~60s serial-flush hold, which QEMU doesn't need) and powers the machine off at the end

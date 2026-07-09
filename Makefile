@@ -90,9 +90,7 @@ build/keys/%: docker-build-base
 
 # ---- stage0-sign: this repo's standalone host-side signer (ed25519 keygen + domain-separated
 # signatures), so stage0 builds + tests without stage1's deploy tool. Built + run in the container.
-# Built for the musl target (like stage1's deploy): the image's global static RUSTFLAGS otherwise
-# apply to a host-gnu build and break proc-macro (clap_derive) compilation; with an explicit
-# --target, cargo builds host proc-macros without those flags.
+# Built for the musl target (like stage1's deploy) so the signer is a fully static host binary.
 # NB: named STAGE0_SIGN, not SIGN -- SIGN is the boot-test matrix's signed-mode flag (SIGN=1),
 # and a command-line `SIGN=1` from the recursive $(MAKE) boot-% would otherwise clobber this path.
 STAGE0_SIGN := crates/stage0-sign/target/x86_64-unknown-linux-musl/debug/stage0-sign
