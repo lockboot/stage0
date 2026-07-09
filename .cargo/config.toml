@@ -1,0 +1,31 @@
+# Per-target rustc flags for stage0. Self-contained: CI checks this repo out ALONE (no workspace
+# parent, CARGO_HOME redirected to an empty dir), so the flags a build needs must live here, not in
+# the workspace-level config. Per target (not one flag set for all) because +crt-static must reach
+# the musl/uefi targets but not the host, where it makes proc-macro dylibs impossible to build.
+#
+# The UEFI flags reproduce the measured binaries byte-for-byte (stage0.efi, ena.efi, test-payload);
+# do not change them without re-pinning PCR4/PCR14 expectations. No `[build] target`: every stage0
+# build passes an explicit `--target`.
+
+[target.x86_64-unknown-linux-musl]
+# Fully static musl for the host-side signer (stage0-sign); rust-lld, no system cc.
+rustflags = ["-C", "linker=rust-lld", "-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "linker=rust-lld", "-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
+
+[target.x86_64-unknown-uefi]
+# The measured bootloader + payloads. Static, rust-lld.
+rustflags = ["-C", "linker=rust-lld", "-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
+
+[target.aarch64-unknown-uefi]
+rustflags = ["-C", "linker=rust-lld", "-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
+
+# Host target for proc-macros and build scripts: rust-lld only (no crt-static), so they link with no
+# system cc. Kept out of the shared workspace config because the gnu-host repos link C and need cc.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "linker=rust-lld"]
+
+[env]
+# Reproducible builds.
+SOURCE_DATE_EPOCH = "0"

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "stage0-sign"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Host-side signer for stage0 artifacts: ed25519 keygen + domain-separated signatures."
+
+# Standalone workspace: a host-side (std) CLI, kept out of the UEFI crates so stage0 stays
+# standalone. The domain framing is duplicated from crates/stage0/src/sig.rs and pinned to stage1's
+# signer byte-for-byte by the golden known-answer test in src/main.rs.
+[workspace]
+
+[[bin]]
+name = "stage0-sign"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+# default-features = false drops the `random` feature (getrandom -> libc -> C toolchain); we supply
+# the seed ourselves, and randomness for keygen comes from /dev/urandom via std.
+ed25519-compact = { version = "2", default-features = false }
+sha2 = "0.10"
