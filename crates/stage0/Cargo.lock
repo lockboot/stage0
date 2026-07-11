@@ -328,8 +328,8 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "vaportpm-attest"
-version = "0.1.0"
-source = "git+https://github.com/lockboot/vaportpm#15770b11a477de3cb92207a76ae27a43ece695de"
+version = "0.3.0"
+source = "git+https://github.com/lockboot/vaportpm?rev=7041f461eb33bc15ad914466042b7befe358d119#7041f461eb33bc15ad914466042b7befe358d119"
 dependencies = [
  "anyhow",
  "hex",

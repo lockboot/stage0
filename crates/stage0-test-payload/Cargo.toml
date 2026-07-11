@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 uefi = { version = "0.35", features = ["alloc", "global_allocator", "panic_handler"] }
-vaportpm-attest = { git = "https://github.com/lockboot/vaportpm", default-features = false }
+vaportpm-attest = { git = "https://github.com/lockboot/vaportpm", rev = "7041f461eb33bc15ad914466042b7befe358d119", version = "=0.3.0", default-features = false }
 anyhow = { version = "1.0", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 

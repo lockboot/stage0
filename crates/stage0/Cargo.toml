@@ -21,7 +21,9 @@ uefi-raw = "0.11"
 
 # no_std TPM core — provides TpmTransport + PCR ops over our EFI_TCG2 transport.
 # Consumed from git like stage1 (the build never sees a local vaportpm checkout).
-vaportpm-attest = { git = "https://github.com/lockboot/vaportpm", default-features = false }
+# Pinned to the vaportpm v0.3.0 release commit: immutable SHA + a `version` guard (the build fails
+# if the rev ever drifts to a commit whose crate version isn't 0.3.0). Tag not GPG-signed yet.
+vaportpm-attest = { git = "https://github.com/lockboot/vaportpm", rev = "7041f461eb33bc15ad914466042b7befe358d119", version = "=0.3.0", default-features = false }
 
 # no_std JSON + hashing for the metadata doc and payload integrity check.
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
