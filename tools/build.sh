@@ -47,11 +47,15 @@ DISK_SIZE_MB=$((PARTITION_SIZE_MB + 2))
 DISK_IMAGE="${OUTPUT_DIR}/boot.disk"
 dd if=/dev/zero of="${DISK_IMAGE}" bs=1M count=${DISK_SIZE_MB} status=none
 
-# Deterministic GUIDs/volume-id derived from the signed binary's hash.
+# Fixed lockboot GUIDs / FAT volume-id: CONSTANT across releases, so the GPT (and hence
+# the firmware's PCR 5 measurement) is byte-stable, and a lockboot disk is identifiable
+# by GUID. "4c4f434b424f4f54" spells "LOCKBOOT"; the last group is a role index
+# (disk = 0, ESP = partition 1).
+DISK_GUID="4c4f434b-424f-4f54-0000-000000000000"
+PART_GUID="4c4f434b-424f-4f54-0000-000000000001"
+VOLUME_ID="4c4f434b"
+# stage0.efi hash — still used for BUILD_ID below.
 EFI_HASH=$(sha256sum "${SIGNED_EFI}" | cut -d' ' -f1)
-DISK_GUID="${EFI_HASH:0:8}-${EFI_HASH:8:4}-${EFI_HASH:12:4}-${EFI_HASH:16:4}-${EFI_HASH:20:12}"
-PART_GUID="${EFI_HASH:32:8}-${EFI_HASH:36:4}-${EFI_HASH:40:4}-${EFI_HASH:44:4}-${EFI_HASH:48:12}"
-VOLUME_ID="${EFI_HASH:0:8}"
 
 sfdisk "${DISK_IMAGE}" <<EOF
 label: gpt
