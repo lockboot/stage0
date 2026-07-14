@@ -68,7 +68,11 @@ pub fn install(controller: Handle, ena: Ena) -> uefi::Result<()> {
     let p = Box::into_raw(dev);
     unsafe {
         (*p).snp.mode = &mut (*p).mode;
-        boot::install_protocol_interface(Some(controller), &SNP_GUID, (&(*p).snp as *const SimpleNetworkProtocol).cast())?;
+        boot::install_protocol_interface(
+            Some(controller),
+            &SNP_GUID,
+            (&(*p).snp as *const SimpleNetworkProtocol).cast(),
+        )?;
     }
     Ok(())
 }
@@ -87,7 +91,10 @@ fn build_mode(mac: [u8; 6]) -> NetworkMode {
         max_packet_size: MAX_PACKET,
         nv_ram_size: 0,
         nv_ram_access_size: 0,
-        receive_filter_mask: (ReceiveFlags::UNICAST | ReceiveFlags::BROADCAST | ReceiveFlags::MULTICAST).bits(),
+        receive_filter_mask: (ReceiveFlags::UNICAST
+            | ReceiveFlags::BROADCAST
+            | ReceiveFlags::MULTICAST)
+            .bits(),
         receive_filter_setting: (ReceiveFlags::UNICAST | ReceiveFlags::BROADCAST).bits(),
         max_mcast_filter_count: 0,
         mcast_filter_count: 0,
@@ -210,7 +217,9 @@ unsafe extern "efiapi" fn get_status(
     }
     let completed = d.ena.poll_tx();
     if !tx_buf.is_null() {
-        *tx_buf = completed.map(|p| p as *mut c_void).unwrap_or(core::ptr::null_mut());
+        *tx_buf = completed
+            .map(|p| p as *mut c_void)
+            .unwrap_or(core::ptr::null_mut());
     }
     if !interrupt_status.is_null() {
         let mut s = InterruptStatus::empty();

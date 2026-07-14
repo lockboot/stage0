@@ -44,7 +44,10 @@ pub fn resolve(host: &str) -> Result<[u8; 4], Status> {
     for srv in &servers {
         crate::sdbg!(
             "stage0:   DNS: asking {}.{}.{}.{} for {host}",
-            srv.0[0], srv.0[1], srv.0[2], srv.0[3]
+            srv.0[0],
+            srv.0[1],
+            srv.0[2],
+            srv.0[3]
         );
         let resp = match crate::udp4::query(srv.0, DNS_PORT, &query, DNS_TRIES, DNS_TRY_MS) {
             Ok(r) => r,
@@ -53,7 +56,10 @@ pub fn resolve(host: &str) -> Result<[u8; 4], Status> {
         if let Ok(ip) = parse_response(&resp, id) {
             crate::sdbg!(
                 "stage0:   resolved {host} -> {}.{}.{}.{}",
-                ip[0], ip[1], ip[2], ip[3]
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3]
             );
             return Ok(ip);
         }
@@ -131,7 +137,10 @@ fn skip_name(msg: &[u8], mut pos: usize) -> Result<usize, Status> {
             return Ok(pos + 1);
         }
         if len & 0xc0 == 0xc0 {
-            return pos.checked_add(2).filter(|&p| p <= msg.len()).ok_or(Status::PROTOCOL_ERROR);
+            return pos
+                .checked_add(2)
+                .filter(|&p| p <= msg.len())
+                .ok_or(Status::PROTOCOL_ERROR);
         }
         pos = pos
             .checked_add(1 + len as usize)
