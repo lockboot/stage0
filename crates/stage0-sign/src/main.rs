@@ -20,17 +20,17 @@ use std::path::{Path, PathBuf};
 /// A signing context — the `stage1.*` roles stage0 admits. `tag()` must match stage1's namespace.
 #[derive(Clone, Copy)]
 enum Domain {
-    Stage1Uki,
-    Stage1Args,
-    Stage1Manifest,
+    Uki,
+    Args,
+    Manifest,
 }
 
 impl Domain {
     fn tag(self) -> &'static str {
         match self {
-            Domain::Stage1Uki => "lockboot.v1.stage1.uki",
-            Domain::Stage1Args => "lockboot.v1.stage1.args",
-            Domain::Stage1Manifest => "lockboot.v1.stage1.manifest",
+            Domain::Uki => "lockboot.v1.stage1.uki",
+            Domain::Args => "lockboot.v1.stage1.args",
+            Domain::Manifest => "lockboot.v1.stage1.manifest",
         }
     }
 }
@@ -39,16 +39,24 @@ impl std::str::FromStr for Domain {
     type Err = &'static str;
     fn from_str(s: &str) -> std::result::Result<Self, &'static str> {
         Ok(match s {
-            "stage1.uki" => Domain::Stage1Uki,
-            "stage1.args" => Domain::Stage1Args,
-            "stage1.manifest" => Domain::Stage1Manifest,
-            _ => return Err("unknown signing domain (want stage1.uki / stage1.args / stage1.manifest)"),
+            "stage1.uki" => Domain::Uki,
+            "stage1.args" => Domain::Args,
+            "stage1.manifest" => Domain::Manifest,
+            _ => {
+                return Err(
+                    "unknown signing domain (want stage1.uki / stage1.args / stage1.manifest)",
+                )
+            }
         })
     }
 }
 
 #[derive(Parser)]
-#[command(name = "stage0-sign", version, about = "ed25519 keygen + domain-separated signatures for stage0 artifacts.")]
+#[command(
+    name = "stage0-sign",
+    version,
+    about = "ed25519 keygen + domain-separated signatures for stage0 artifacts."
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -108,12 +116,23 @@ fn keygen(a: KeygenArgs) -> Result<()> {
 }
 
 fn sign_cmd(a: SignArgs) -> Result<()> {
-    let domain: Domain = a.domain.parse().map_err(|e| anyhow!("--domain {}: {e}", a.domain))?;
-    let pem = std::fs::read_to_string(&a.key).with_context(|| format!("reading key {}", a.key.display()))?;
-    let bytes = std::fs::read(&a.input).with_context(|| format!("reading {}", a.input.display()))?;
+    let domain: Domain = a
+        .domain
+        .parse()
+        .map_err(|e| anyhow!("--domain {}: {e}", a.domain))?;
+    let pem = std::fs::read_to_string(&a.key)
+        .with_context(|| format!("reading key {}", a.key.display()))?;
+    let bytes =
+        std::fs::read(&a.input).with_context(|| format!("reading {}", a.input.display()))?;
     let (sig, pubkey) = sign_bytes(&pem, domain, &bytes)?;
     std::fs::write(&a.out, &sig).with_context(|| format!("writing {}", a.out.display()))?;
-    println!("signed {} [{}] -> {} (pubkey {})", a.input.display(), domain.tag(), a.out.display(), pubkey);
+    println!(
+        "signed {} [{}] -> {} (pubkey {})",
+        a.input.display(),
+        domain.tag(),
+        a.out.display(),
+        pubkey
+    );
     Ok(())
 }
 
@@ -137,8 +156,14 @@ fn sign_bytes(pem: &str, domain: Domain, message: &[u8]) -> Result<(Vec<u8>, Str
 
 /// Extract the 32-byte ed25519 seed from a PKCS#8 PEM (RFC 8410): `... 04 22 04 20 <seed>`.
 fn seed_from_pkcs8_pem(pem: &str) -> Result<[u8; 32]> {
-    let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect::<Vec<_>>().concat();
-    let der = STANDARD.decode(b64.trim()).context("private key PEM body is not valid base64")?;
+    let b64: String = pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .concat();
+    let der = STANDARD
+        .decode(b64.trim())
+        .context("private key PEM body is not valid base64")?;
     let pos = der
         .windows(4)
         .position(|w| w == [0x04u8, 0x22, 0x04, 0x20])
@@ -159,7 +184,10 @@ fn pem_from_seed(seed: &[u8; 32]) -> String {
         0x20,
     ];
     der.extend_from_slice(seed);
-    format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", STANDARD.encode(&der))
+    format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        STANDARD.encode(&der)
+    )
 }
 
 /// 32 CSPRNG bytes from the kernel via `/dev/urandom` (std only — no getrandom/libc/C toolchain).
@@ -184,7 +212,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .mode(0o600)
         .open(path)
         .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(bytes).with_context(|| format!("writing {}", path.display()))
+    f.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -196,8 +225,12 @@ mod tests {
     /// vice-versa for the shared `stage1.*` roles. Drift in either repo's framing fails CI.
     #[test]
     fn golden_kat() {
-        let (sig, pubkey) =
-            sign_bytes(&pem_from_seed(&[7u8; 32]), Domain::Stage1Manifest, b"lockboot-kat").unwrap();
+        let (sig, pubkey) = sign_bytes(
+            &pem_from_seed(&[7u8; 32]),
+            Domain::Manifest,
+            b"lockboot-kat",
+        )
+        .unwrap();
         assert_eq!(pubkey, "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=");
         assert_eq!(
             STANDARD.encode(&sig),

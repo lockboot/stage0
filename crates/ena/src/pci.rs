@@ -27,9 +27,9 @@ pub enum PciWidth {
 #[repr(u32)]
 #[derive(Clone, Copy)]
 pub enum PciMapOp {
-    BusMasterRead = 0,
-    BusMasterWrite = 1,
-    BusMasterCommonBuffer = 2,
+    Read = 0,
+    Write = 1,
+    CommonBuffer = 2,
 }
 
 /// `EFI_PCI_IO_PROTOCOL_ATTRIBUTE_OPERATION`.
@@ -75,7 +75,8 @@ type MapFn = unsafe extern "efiapi" fn(
     mapping: *mut *mut c_void,
 ) -> Status;
 
-type UnmapFn = unsafe extern "efiapi" fn(this: *const PciIoProtocol, mapping: *mut c_void) -> Status;
+type UnmapFn =
+    unsafe extern "efiapi" fn(this: *const PciIoProtocol, mapping: *mut c_void) -> Status;
 
 // alloc_type / memory_type are EFI enums; u32 matches their ABI without importing them.
 type AllocBufferFn = unsafe extern "efiapi" fn(
@@ -87,8 +88,11 @@ type AllocBufferFn = unsafe extern "efiapi" fn(
     attributes: u64,
 ) -> Status;
 
-type FreeBufferFn =
-    unsafe extern "efiapi" fn(this: *const PciIoProtocol, pages: usize, host_address: *mut c_void) -> Status;
+type FreeBufferFn = unsafe extern "efiapi" fn(
+    this: *const PciIoProtocol,
+    pages: usize,
+    host_address: *mut c_void,
+) -> Status;
 
 type AttributesFn = unsafe extern "efiapi" fn(
     this: *const PciIoProtocol,
@@ -145,13 +149,7 @@ impl PciIo {
     pub fn vendor_device(&self) -> uefi::Result<(u16, u16)> {
         let mut dw: u32 = 0;
         let st = unsafe {
-            (self.0.pci.read)(
-                &self.0,
-                PciWidth::U32,
-                0,
-                1,
-                (&mut dw as *mut u32).cast(),
-            )
+            (self.0.pci.read)(&self.0, PciWidth::U32, 0, 1, (&mut dw as *mut u32).cast())
         };
         if st.is_success() {
             Ok((dw as u16, (dw >> 16) as u16))

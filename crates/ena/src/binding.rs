@@ -49,7 +49,9 @@ unsafe extern "efiapi" fn supported(
         agent: boot::image_handle(),
         controller: None,
     };
-    let pci = match unsafe { boot::open_protocol::<PciIo>(params, boot::OpenProtocolAttributes::GetProtocol) } {
+    let pci = match unsafe {
+        boot::open_protocol::<PciIo>(params, boot::OpenProtocolAttributes::GetProtocol)
+    } {
         Ok(p) => p,
         Err(_) => return Status::UNSUPPORTED,
     };
@@ -76,14 +78,19 @@ unsafe extern "efiapi" fn start(
         agent: boot::image_handle(),
         controller: Some(controller),
     };
-    let pci = match unsafe { boot::open_protocol::<PciIo>(params, boot::OpenProtocolAttributes::ByDriver) } {
+    let pci = match unsafe {
+        boot::open_protocol::<PciIo>(params, boot::OpenProtocolAttributes::ByDriver)
+    } {
         Ok(p) => p,
         Err(e) => {
             // ALREADY_STARTED is expected: connect_all_controllers reaches ENA twice (via
             // the parent bus and directly), so start() is invoked a second time once we
             // already manage the device. That is benign; only log genuine failures.
             if e.status() != Status::ALREADY_STARTED {
-                uefi::println!("ena: start(): open PciIo BY_DRIVER failed: {:?}", e.status());
+                uefi::println!(
+                    "ena: start(): open PciIo BY_DRIVER failed: {:?}",
+                    e.status()
+                );
             }
             return e.status();
         }
@@ -100,7 +107,13 @@ unsafe extern "efiapi" fn start(
     let mac = ena.mac();
     uefi::println!(
         "ena: probe OK mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], ena.mtu
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5],
+        ena.mtu
     );
     // Keep PciIo open for the device's lifetime (probe stored the raw pointer in `ena`).
     core::mem::forget(pci);

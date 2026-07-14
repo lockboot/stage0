@@ -26,7 +26,7 @@ use core::sync::atomic::{fence, Ordering};
 use uefi::boot;
 use uefi::Status;
 
-use crate::pci::{PciAttrOp, PciMapOp, PciWidth, PciIoProtocol, PCI_ATTR_BUS_MASTER};
+use crate::pci::{PciAttrOp, PciIoProtocol, PciMapOp, PciWidth, PCI_ATTR_BUS_MASTER};
 
 /// `uefi::println!` with an `ena:` prefix; no alloc, writes straight to the console.
 macro_rules! log {
@@ -74,7 +74,7 @@ const DEV_CTL_RESET: u32 = 1 << 0;
 // DEV_STS bits (ena_regs DEV_STS layout). RESET_IN_PROGRESS is bit 3 (0x8), NOT bit 1.
 const DEV_STS_READY: u32 = 1 << 0; // 0x01
 const DEV_STS_RESET_IN_PROGRESS: u32 = 1 << 3; // 0x08
-// CAPS fields: reset timeout in 100ms units at bits [6:1].
+                                               // CAPS fields: reset timeout in 100ms units at bits [6:1].
 const CAPS_RESET_TIMEOUT_SHIFT: u32 = 1;
 const CAPS_RESET_TIMEOUT_MASK: u32 = 0x3e;
 
@@ -103,7 +103,7 @@ const DEPTH_MAX: u16 = 1024; // sanity ceiling on the device-reported max depth
 const SQ_DESC_SIZE: usize = 16; // ena_eth_io_{tx,rx}_desc are 16 bytes
 const RX_CDESC_WORDS: u8 = 4; // ena_eth_io_rx_cdesc_base = 16 bytes
 const TX_CDESC_WORDS: u8 = 2; // ena_eth_io_tx_cdesc = 8 bytes
-// CREATE_SQ sq_identity.sq_direction [6:5].
+                              // CREATE_SQ sq_identity.sq_direction [6:5].
 const SQ_DIR_TX: u8 = 1 << 5;
 const SQ_DIR_RX: u8 = 2 << 5;
 // CREATE_SQ caps: placement_policy HOST (1) in [3:0]; is_physically_contiguous bit0.
@@ -146,7 +146,7 @@ const ADMIN_DEPTH: u16 = 16;
 const ADMIN_ENTRY_SIZE: u32 = 64;
 const AENQ_DEPTH: u16 = 2; // ENA_AENQ_COUNT
 const AENQ_ENTRY_SIZE: u32 = 64; // ena_admin_aenq_entry is 64 bytes (was wrongly 16)
-// AQ/ACQ caps register layout: depth in [15:0], entry-size in [31:16].
+                                 // AQ/ACQ caps register layout: depth in [15:0], entry-size in [31:16].
 fn caps_word(depth: u16, entry_size: u32) -> u32 {
     (depth as u32) | (entry_size << 16)
 }
@@ -187,7 +187,14 @@ unsafe fn enable_msix(pci: &PciIoProtocol) {
 
 unsafe fn reg_read32(pci: &PciIoProtocol, off: u64) -> u32 {
     let mut v: u32 = 0;
-    let st = (pci.mem.read)(pci, PciWidth::U32, ENA_REG_BAR, off, 1, (&mut v as *mut u32).cast());
+    let st = (pci.mem.read)(
+        pci,
+        PciWidth::U32,
+        ENA_REG_BAR,
+        off,
+        1,
+        (&mut v as *mut u32).cast(),
+    );
     if !st.is_success() {
         log!("  MMIO read @0x{off:02x} failed: {st:?}");
     }
@@ -196,7 +203,14 @@ unsafe fn reg_read32(pci: &PciIoProtocol, off: u64) -> u32 {
 
 unsafe fn reg_write32(pci: &PciIoProtocol, off: u64, val: u32) {
     let mut v = val;
-    let st = (pci.mem.write)(pci, PciWidth::U32, ENA_REG_BAR, off, 1, (&mut v as *mut u32).cast());
+    let st = (pci.mem.write)(
+        pci,
+        PciWidth::U32,
+        ENA_REG_BAR,
+        off,
+        1,
+        (&mut v as *mut u32).cast(),
+    );
     if !st.is_success() {
         log!("  MMIO write @0x{off:02x} failed: {st:?}");
     }
@@ -232,7 +246,11 @@ impl Dma {
         );
         if !st.is_success() || host.is_null() {
             log!("  AllocateBuffer({pages} pages) failed: {st:?}");
-            return Err(if st.is_success() { Status::OUT_OF_RESOURCES } else { st });
+            return Err(if st.is_success() {
+                Status::OUT_OF_RESOURCES
+            } else {
+                st
+            });
         }
         core::ptr::write_bytes(host as *mut u8, 0, pages * PAGE);
 
@@ -241,7 +259,7 @@ impl Dma {
         let mut mapping: *mut c_void = core::ptr::null_mut();
         let st = (pci.map)(
             pci,
-            PciMapOp::BusMasterCommonBuffer,
+            PciMapOp::CommonBuffer,
             host as *const c_void,
             &mut nbytes,
             &mut dev,
@@ -252,7 +270,12 @@ impl Dma {
             let _ = (pci.free_buffer)(pci, pages, host);
             return Err(st);
         }
-        Ok(Dma { host: host as *mut u8, dev, pages, mapping })
+        Ok(Dma {
+            host: host as *mut u8,
+            dev,
+            pages,
+            mapping,
+        })
     }
 }
 
@@ -274,7 +297,12 @@ impl AdminQueue {
         let sq = Dma::alloc(pci, ADMIN_DEPTH as usize * ADMIN_ENTRY_SIZE as usize)?;
         let cq = Dma::alloc(pci, ADMIN_DEPTH as usize * ADMIN_ENTRY_SIZE as usize)?;
         let aenq = Dma::alloc(pci, AENQ_DEPTH as usize * AENQ_ENTRY_SIZE as usize)?;
-        log!("  admin DMA: sq dev=0x{:x} cq dev=0x{:x} aenq dev=0x{:x}", sq.dev, cq.dev, aenq.dev);
+        log!(
+            "  admin DMA: sq dev=0x{:x} cq dev=0x{:x} aenq dev=0x{:x}",
+            sq.dev,
+            cq.dev,
+            aenq.dev
+        );
 
         // Exact ena_com_admin_init order: AQ base, ACQ base, AQ caps, ACQ caps, THEN the
         // AENQ (base, caps, head doorbell). The openbsd-ena writeup found the device only
@@ -285,7 +313,11 @@ impl AdminQueue {
         reg_write32(pci, regs::ACQ_BASE_HI, (cq.dev >> 32) as u32);
         fence(Ordering::SeqCst);
         reg_write32(pci, regs::AQ_CAPS, caps_word(ADMIN_DEPTH, ADMIN_ENTRY_SIZE));
-        reg_write32(pci, regs::ACQ_CAPS, caps_word(ADMIN_DEPTH, ADMIN_ENTRY_SIZE));
+        reg_write32(
+            pci,
+            regs::ACQ_CAPS,
+            caps_word(ADMIN_DEPTH, ADMIN_ENTRY_SIZE),
+        );
         fence(Ordering::SeqCst);
         // AENQ: base, then caps, then head doorbell (q_depth = all slots initially free).
         reg_write32(pci, regs::AENQ_BASE_LO, aenq.dev as u32);
@@ -328,7 +360,7 @@ impl AdminQueue {
 
         // Advance tail (free-running, wraps the ring; phase flips on wrap).
         self.sq_tail = self.sq_tail.wrapping_add(1);
-        if self.sq_tail % ADMIN_DEPTH == 0 {
+        if self.sq_tail.is_multiple_of(ADMIN_DEPTH) {
             self.sq_phase ^= 1;
         }
         reg_write32(pci, regs::AQ_DB, self.sq_tail as u32);
@@ -346,7 +378,11 @@ impl AdminQueue {
                 break;
             }
             if waited >= deadline_ticks {
-                log!("  !! admin completion timeout (cq_head={} phase={})", self.cq_head, self.cq_phase);
+                log!(
+                    "  !! admin completion timeout (cq_head={} phase={})",
+                    self.cq_head,
+                    self.cq_phase
+                );
                 return Err(Status::TIMEOUT);
             }
             delay_ms(1);
@@ -362,13 +398,16 @@ impl AdminQueue {
 
         // Advance completion head; flip expected phase on wrap.
         self.cq_head = self.cq_head.wrapping_add(1);
-        if self.cq_head % ADMIN_DEPTH == 0 {
+        if self.cq_head.is_multiple_of(ADMIN_DEPTH) {
             self.cq_phase ^= 1;
         }
 
         if status != 0 {
             let ext = (out[5] as u16) << 8 | out[4] as u16;
-            log!("  !! admin cmd opcode={} failed: status={status} ext=0x{ext:04x}", (*cmd)[2]);
+            log!(
+                "  !! admin cmd opcode={} failed: status={status} ext=0x{ext:04x}",
+                (*cmd)[2]
+            );
             return Err(Status::DEVICE_ERROR);
         }
         Ok(out)
@@ -401,7 +440,10 @@ unsafe fn create_cq(
     msix_vector: u32,
 ) -> Result<IoQueue, Status> {
     let dma = Dma::alloc(pci, depth as usize * entry_words as usize * 4)?;
-    log!("  create_cq: dev=0x{:x} words={entry_words} depth={depth} vec={msix_vector}", dma.dev);
+    log!(
+        "  create_cq: dev=0x{:x} words={entry_words} depth={depth} vec={msix_vector}",
+        dma.dev
+    );
     let mut cmd = [0u8; 64];
     cmd[2] = OP_CREATE_CQ;
     cmd[4] = CQ_CAPS_1_POLL_MODE; // cq_caps_1: poll mode, no interrupt (see const)
@@ -480,7 +522,7 @@ unsafe fn set_host_attributes(pci: &PciIoProtocol, admin: &mut AdminQueue) -> Re
     cmd[17] = FEAT_HOST_ATTRIBUTES;
     write_mem_addr(&mut cmd, 20, info.dev); // os_info_ba
     admin.submit(pci, &cmd)?;
-    core::mem::forget(info); // keep the page mapped for the device's lifetime
+    // Dma has no destructor, so `info` pages stay mapped for the device lifetime (intentional leak).
     Ok(())
 }
 
@@ -492,7 +534,7 @@ pub struct Ena {
     pci: *const PciIoProtocol,
     mac: [u8; 6],
     pub mtu: u32,
-    depth: u16, // IO ring depth, queried from the device (see DEPTH_MIN/MAX)
+    depth: u16,         // IO ring depth, queried from the device (see DEPTH_MIN/MAX)
     _admin: AdminQueue, // kept so its DMA isn't freed
     rx_cq: IoQueue,
     rx_sq: IoQueue,
@@ -528,7 +570,8 @@ impl Ena {
         let dev = self.rx_bufs[buf_idx].dev;
         wr_u16(d, 0, BUF_SIZE as u16); // length
         d.add(2).write_volatile(0);
-        d.add(3).write_volatile(RX_DESC_CTRL | (self.rx_sq_phase & 1)); // ctrl
+        d.add(3)
+            .write_volatile(RX_DESC_CTRL | (self.rx_sq_phase & 1)); // ctrl
         wr_u16(d, 4, buf_idx as u16); // req_id
         wr_u16(d, 6, 0);
         wr_u32(d, 8, dev as u32); // buff_addr_lo
@@ -536,7 +579,7 @@ impl Ena {
         wr_u16(d, 14, 0);
         fence(Ordering::SeqCst);
         self.rx_sq_tail = self.rx_sq_tail.wrapping_add(1);
-        if self.rx_sq_tail % self.depth == 0 {
+        if self.rx_sq_tail.is_multiple_of(self.depth) {
             self.rx_sq_phase ^= 1;
         }
         self.db(self.rx_sq.db_off, self.rx_sq_tail as u32);
@@ -554,7 +597,11 @@ impl Ena {
     /// RX completion ring is empty. Refills the consumed buffer.
     pub unsafe fn receive(&mut self, out: *mut u8, cap: usize) -> Option<usize> {
         let slot = (self.rx_cq_head % self.depth) as usize;
-        let c = self.rx_cq.dma.host.add(slot * (RX_CDESC_WORDS as usize * 4));
+        let c = self
+            .rx_cq
+            .dma
+            .host
+            .add(slot * (RX_CDESC_WORDS as usize * 4));
         if (rd_u8(c, 3) & 1) != (self.rx_cq_phase & 1) {
             return None; // status bit24 (byte3 bit0) = phase: not yet written
         }
@@ -566,7 +613,7 @@ impl Ena {
             core::ptr::copy_nonoverlapping(self.rx_bufs[req_id].host, out, n);
         }
         self.rx_cq_head = self.rx_cq_head.wrapping_add(1);
-        if self.rx_cq_head % self.depth == 0 {
+        if self.rx_cq_head.is_multiple_of(self.depth) {
             self.rx_cq_phase ^= 1;
         }
         if req_id < self.rx_bufs.len() {
@@ -577,7 +624,12 @@ impl Ena {
 
     /// Queue `len` bytes from `data` for transmit (copied into a bounce buffer).
     /// `caller` is handed back by `poll_tx` once the hardware completes it.
-    pub unsafe fn transmit(&mut self, data: *const u8, len: usize, caller: *const c_void) -> Result<(), Status> {
+    pub unsafe fn transmit(
+        &mut self,
+        data: *const u8,
+        len: usize,
+        caller: *const c_void,
+    ) -> Result<(), Status> {
         // Limited by the bounce-buffer count, not the ring depth (buffers are decoupled).
         if self.tx_sq_tail.wrapping_sub(self.tx_cq_head) >= TX_FILL {
             return Err(Status::NOT_READY); // caller must GetStatus to drain completions
@@ -596,7 +648,7 @@ impl Ena {
         fence(Ordering::SeqCst);
         self.tx_caller[bslot] = caller;
         self.tx_sq_tail = self.tx_sq_tail.wrapping_add(1);
-        if self.tx_sq_tail % self.depth == 0 {
+        if self.tx_sq_tail.is_multiple_of(self.depth) {
             self.tx_sq_phase ^= 1;
         }
         self.db(self.tx_sq.db_off, self.tx_sq_tail as u32);
@@ -607,13 +659,17 @@ impl Ena {
     /// submission order on a single SQ, so the completion slot matches the submit slot.
     pub unsafe fn poll_tx(&mut self) -> Option<*const c_void> {
         let slot = (self.tx_cq_head % self.depth) as usize;
-        let c = self.tx_cq.dma.host.add(slot * (TX_CDESC_WORDS as usize * 4));
+        let c = self
+            .tx_cq
+            .dma
+            .host
+            .add(slot * (TX_CDESC_WORDS as usize * 4));
         if (rd_u8(c, 3) & 1) != (self.tx_cq_phase & 1) {
             return None; // tx cdesc flags.phase (byte3 bit0)
         }
         let caller = self.tx_caller[(self.tx_cq_head % TX_FILL) as usize];
         self.tx_cq_head = self.tx_cq_head.wrapping_add(1);
-        if self.tx_cq_head % self.depth == 0 {
+        if self.tx_cq_head.is_multiple_of(self.depth) {
             self.tx_cq_phase ^= 1;
         }
         Some(caller)
@@ -628,10 +684,19 @@ pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Ena, Status> {
     // Record which ENA variant we bound (PCI config dword 0 = vendor | device<<16).
     let mut vd: u32 = 0;
     let _ = (pci.pci.read)(pci, PciWidth::U32, 0, 1, (&mut vd as *mut u32).cast());
-    log!("PCI vendor=0x{:04x} device=0x{:04x}", vd as u16, (vd >> 16) as u16);
+    log!(
+        "PCI vendor=0x{:04x} device=0x{:04x}",
+        vd as u16,
+        (vd >> 16) as u16
+    );
 
     // Enable bus mastering before any DMA.
-    let st = (pci.attributes)(pci, PciAttrOp::Enable, PCI_ATTR_BUS_MASTER, core::ptr::null_mut());
+    let st = (pci.attributes)(
+        pci,
+        PciAttrOp::Enable,
+        PCI_ATTR_BUS_MASTER,
+        core::ptr::null_mut(),
+    );
     log!("bus-master enable: {st:?}");
 
     // Leave the function's MSI-X capability enabled (we still poll; CQ vector = NONE).
@@ -650,7 +715,7 @@ pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Ena, Status> {
     reg_write32(pci, regs::MMIO_RESP_LO, resp.dev as u32);
     reg_write32(pci, regs::MMIO_RESP_HI, (resp.dev >> 32) as u32);
     fence(Ordering::SeqCst);
-    core::mem::forget(resp); // keep mapped for the device's lifetime
+    // Dma has no destructor, so `resp` stays mapped for the device lifetime (intentional leak).
 
     let mut admin = AdminQueue::create(pci)?;
 
@@ -672,8 +737,15 @@ pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Ena, Status> {
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&resp[32..38]);
     let mtu = u32::from_le_bytes([resp[40], resp[41], resp[42], resp[43]]);
-    log!("DEVICE_ATTRIBUTES: mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} max_mtu={mtu}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    log!(
+        "DEVICE_ATTRIBUTES: mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} max_mtu={mtu}",
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5]
+    );
 
     // Init SET_FEATUREs the firmware requires before IO-queue creation (matches iPXE):
     // configure async-event groups, then register the host-info page (whose driver_version
@@ -705,7 +777,8 @@ pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Ena, Status> {
                 let (txd, rxd) = (u32at(32), u32at(40));
                 log!(
                     "MAX_QUEUES_EXT: tx_cq_num={} rx_cq_num={} tx_cq_depth={txd} rx_cq_depth={rxd}",
-                    u32at(16), u32at(24)
+                    u32at(16),
+                    u32at(24)
                 );
                 dev_cq_depth = txd.min(rxd).min(u32::from(u16::MAX)) as u16;
             }
@@ -758,10 +831,22 @@ pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Ena, Status> {
     log!("creating IO queues (depth {depth})...");
     let tx_cq = create_cq(pci, &mut admin, depth, TX_CDESC_WORDS, ENA_MSIX_NONE)?;
     let tx_sq = create_sq(pci, &mut admin, depth, tx_cq.idx, SQ_DIR_TX)?;
-    log!("  tx: cq idx={} db=0x{:x}  sq idx={} db=0x{:x}", tx_cq.idx, tx_cq.db_off, tx_sq.idx, tx_sq.db_off);
+    log!(
+        "  tx: cq idx={} db=0x{:x}  sq idx={} db=0x{:x}",
+        tx_cq.idx,
+        tx_cq.db_off,
+        tx_sq.idx,
+        tx_sq.db_off
+    );
     let rx_cq = create_cq(pci, &mut admin, depth, RX_CDESC_WORDS, ENA_MSIX_NONE)?;
     let rx_sq = create_sq(pci, &mut admin, depth, rx_cq.idx, SQ_DIR_RX)?;
-    log!("  rx: cq idx={} db=0x{:x}  sq idx={} db=0x{:x}", rx_cq.idx, rx_cq.db_off, rx_sq.idx, rx_sq.db_off);
+    log!(
+        "  rx: cq idx={} db=0x{:x}  sq idx={} db=0x{:x}",
+        rx_cq.idx,
+        rx_cq.db_off,
+        rx_sq.idx,
+        rx_sq.db_off
+    );
 
     // RX + TX buffers: a small fixed fill, decoupled from the (possibly deep) ring.
     let mut rx_bufs = Vec::with_capacity(RX_FILL);
@@ -772,7 +857,11 @@ pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Ena, Status> {
     for _ in 0..TX_FILL {
         tx_bufs.push(Dma::alloc(pci, BUF_SIZE)?);
     }
-    log!("IO queues created OK; {} rx + {} tx buffers allocated", rx_bufs.len(), tx_bufs.len());
+    log!(
+        "IO queues created OK; {} rx + {} tx buffers allocated",
+        rx_bufs.len(),
+        tx_bufs.len()
+    );
 
     Ok(Ena {
         pci: pci as *const PciIoProtocol,
@@ -804,11 +893,19 @@ unsafe fn reset(pci: &PciIoProtocol, caps: u32) -> Result<(), Status> {
     let timeout_units = ((caps & CAPS_RESET_TIMEOUT_MASK) >> CAPS_RESET_TIMEOUT_SHIFT).max(1);
     let timeout_ms = timeout_units as usize * 100;
     let sts0 = reg_read32(pci, regs::DEV_STS);
-    log!("reset: DEV_STS=0x{sts0:08x} (ready={}) timeout={timeout_ms}ms", sts0 & DEV_STS_READY);
+    log!(
+        "reset: DEV_STS=0x{sts0:08x} (ready={}) timeout={timeout_ms}ms",
+        sts0 & DEV_STS_READY
+    );
 
     reg_write32(pci, regs::DEV_CTL, DEV_CTL_RESET);
     fence(Ordering::SeqCst);
-    if !wait_sts(pci, DEV_STS_RESET_IN_PROGRESS, DEV_STS_RESET_IN_PROGRESS, timeout_ms) {
+    if !wait_sts(
+        pci,
+        DEV_STS_RESET_IN_PROGRESS,
+        DEV_STS_RESET_IN_PROGRESS,
+        timeout_ms,
+    ) {
         log!("!! reset never entered RESET_IN_PROGRESS");
         return Err(Status::DEVICE_ERROR);
     }
@@ -821,7 +918,10 @@ unsafe fn reset(pci: &PciIoProtocol, caps: u32) -> Result<(), Status> {
         return Err(Status::DEVICE_ERROR);
     }
     let sts = reg_read32(pci, regs::DEV_STS);
-    log!("reset: done DEV_STS=0x{sts:08x} (ready={})", sts & DEV_STS_READY);
+    log!(
+        "reset: done DEV_STS=0x{sts:08x} (ready={})",
+        sts & DEV_STS_READY
+    );
     Ok(())
 }
 

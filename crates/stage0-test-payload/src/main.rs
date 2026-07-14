@@ -21,9 +21,9 @@ use anyhow::{anyhow, bail, Result};
 use uefi::boot::{self, ScopedProtocol};
 use uefi::prelude::*;
 use uefi::println;
-use uefi::runtime::{self, ResetType};
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::tcg::v2::Tcg;
+use uefi::runtime::{self, ResetType};
 use vaportpm_attest::{PcrOps, TpmTransport};
 
 struct Tcg2Transport {
@@ -124,7 +124,11 @@ fn print_pcrs() -> Result<()> {
 
     println!("payload: ===PCR-DUMP-BEGIN===");
     for (idx, alg, value) in &pcrs {
-        println!("payload: PCR {} {idx:02} {}", alg.name(), hex::encode(value));
+        println!(
+            "payload: PCR {} {idx:02} {}",
+            alg.name(),
+            hex::encode(value)
+        );
     }
     println!("payload: ===PCR-DUMP-END===");
     Ok(())

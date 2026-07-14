@@ -26,19 +26,19 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Domain {
     /// `_stage1` payload (the UKI).
-    Stage1Uki,
+    Uki,
     /// `_stage1` LoadOptions (signed args).
-    Stage1Args,
+    Args,
     /// `_stage1` signed manifest.
-    Stage1Manifest,
+    Manifest,
 }
 
 impl Domain {
     fn tag(self) -> &'static str {
         match self {
-            Domain::Stage1Uki => "lockboot.v1.stage1.uki",
-            Domain::Stage1Args => "lockboot.v1.stage1.args",
-            Domain::Stage1Manifest => "lockboot.v1.stage1.manifest",
+            Domain::Uki => "lockboot.v1.stage1.uki",
+            Domain::Args => "lockboot.v1.stage1.args",
+            Domain::Manifest => "lockboot.v1.stage1.manifest",
         }
     }
 }

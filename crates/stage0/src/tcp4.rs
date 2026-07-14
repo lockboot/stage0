@@ -240,7 +240,11 @@ fn exchange_on_child(
     }
     crate::sdbg!(
         "stage0:   TCP4 connected to {}.{}.{}.{}:{}",
-        ip[0], ip[1], ip[2], ip[3], port
+        ip[0],
+        ip[1],
+        ip[2],
+        ip[3],
+        port
     );
 
     let send_res = tcp_send(tcp_ptr, request);

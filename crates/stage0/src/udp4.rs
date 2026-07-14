@@ -263,7 +263,9 @@ fn udp_send(udp_ptr: *mut Udp4Protocol, data: &[u8]) -> Result<(), Status> {
     let mut token = CompletionToken {
         event,
         status: Status::NOT_READY,
-        packet: Packet { tx_data: &tx as *const TxData },
+        packet: Packet {
+            tx_data: &tx as *const TxData,
+        },
     };
     let st = unsafe { ((*udp_ptr).transmit)(udp_ptr, &mut token) };
     let st = if st == Status::SUCCESS {
@@ -290,7 +292,9 @@ fn udp_recv(udp_ptr: *mut Udp4Protocol, budget_ms: u64) -> Result<Vec<u8>, Statu
     let mut token = CompletionToken {
         event,
         status: Status::NOT_READY,
-        packet: Packet { rx_data: ptr::null_mut() },
+        packet: Packet {
+            rx_data: ptr::null_mut(),
+        },
     };
     let call = unsafe { ((*udp_ptr).receive)(udp_ptr, &mut token) };
     let st = if call == Status::SUCCESS {

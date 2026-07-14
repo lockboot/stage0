@@ -23,16 +23,25 @@ const DHCP_TIMEOUT_MS: u64 = 30_000;
 /// Building stage0 requires `build/<arch>/ena.efi` to exist (the Makefile builds it
 /// first); a missing file is a hard compile error, by design.
 #[cfg(target_arch = "x86_64")]
-static ENA_DRIVER: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/x86_64/ena.efi"));
+static ENA_DRIVER: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/x86_64/ena.efi"
+));
 #[cfg(target_arch = "aarch64")]
-static ENA_DRIVER: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/aarch64/ena.efi"));
+static ENA_DRIVER: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/aarch64/ena.efi"
+));
 
 /// Load and start any embedded UEFI NIC drivers, before connecting controllers, so a
 /// firmware that lacks a driver for its NIC (notably EC2/ENA) still gets an SNP
 /// producer. The driver is a well-behaved Driver-Model driver: inert on platforms
 /// whose NIC it does not match (GCP virtio-net, local QEMU).
 fn load_embedded_drivers() {
-    crate::slog!("stage0: loading embedded ena driver ({} bytes)", ENA_DRIVER.len());
+    crate::slog!(
+        "stage0: loading embedded ena driver ({} bytes)",
+        ENA_DRIVER.len()
+    );
     match crate::secauth::load_image_verified(ENA_DRIVER) {
         Ok(handle) => match boot::start_image(handle) {
             Ok(()) => crate::slog!("stage0: ena driver started"),
@@ -66,7 +75,13 @@ fn dhcp_up(ip4: &mut Ip4Config2) -> Result<(), Status> {
     let info = ip4.get_interface_info().map_err(|e| e.status())?;
     if addr(info.station_addr) != [0, 0, 0, 0] {
         let a = addr(info.station_addr);
-        crate::slog!("stage0: network: OK {}.{}.{}.{} (already up)", a[0], a[1], a[2], a[3]);
+        crate::slog!(
+            "stage0: network: OK {}.{}.{}.{} (already up)",
+            a[0],
+            a[1],
+            a[2],
+            a[3]
+        );
         return Ok(());
     }
 
@@ -82,7 +97,13 @@ fn dhcp_up(ip4: &mut Ip4Config2) -> Result<(), Status> {
         let a = addr(info.station_addr);
         if a != [0, 0, 0, 0] {
             let took = crate::timing::since_boot_ms().wrapping_sub(start);
-            crate::slog!("stage0: network: OK {}.{}.{}.{} (DHCP {took} ms)", a[0], a[1], a[2], a[3]);
+            crate::slog!(
+                "stage0: network: OK {}.{}.{}.{} (DHCP {took} ms)",
+                a[0],
+                a[1],
+                a[2],
+                a[3]
+            );
             return Ok(());
         }
         if crate::timing::since_boot_ms().wrapping_sub(start) >= DHCP_TIMEOUT_MS {

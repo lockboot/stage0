@@ -44,6 +44,9 @@ use uefi::proto::loaded_image::LoadedImage;
 use uefi::runtime::{self, ResetType, VariableVendor};
 use uefi::{CStr16, CString16};
 
+/// Admission result: the admitted binary, its SHA-256 digest, and the optional load-options string.
+type Admitted = Result<(Vec<u8>, [u8; 32], Option<String>), Status>;
+
 /// PCR extended with SHA-256 of the loaded payload (matches stage1's binary PCR).
 const PCR_BINARY: u8 = 14;
 
@@ -70,7 +73,10 @@ fn main() -> Status {
     // platform (payload, firmware) can no longer be trusted. Fail CLOSED by powering
     // the machine off. Hold first (see FAIL_CLOSED_DRAIN_US) so the cloud serial
     // console actually captures the error before the instance halts.
-    crate::slog!("stage0: powering off in {}s (fail-closed)", FAIL_CLOSED_DRAIN_US / 1_000_000);
+    crate::slog!(
+        "stage0: powering off in {}s (fail-closed)",
+        FAIL_CLOSED_DRAIN_US / 1_000_000
+    );
     boot::stall(FAIL_CLOSED_DRAIN_US);
     runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None)
 }
@@ -199,7 +205,7 @@ fn download_first(urls: &[String]) -> Result<Vec<u8>, Status> {
 /// (url,hash) is a cycle and fails closed. stage0 forwards no document (the UKI re-fetches its own
 /// metadata), so the merged doc drives only re-evaluation. Returns the admitted binary, its digest,
 /// and the load options (signed args, else inline `args` joined by spaces).
-fn resolve_payload(json: &[u8]) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+fn resolve_payload(json: &[u8]) -> Admitted {
     // Validate the document up front (clear error) + confirm this arch is present, then drive
     // resolution off a Value so a signed manifest fragment can be deep-merged and re-evaluated.
     let ud = config::parse(json).map_err(|m| {
@@ -210,7 +216,11 @@ fn resolve_payload(json: &[u8]) -> Result<(Vec<u8>, [u8; 32], Option<String>), S
         crate::slog!("stage0: no _stage1 config for this architecture");
         Status::UNSUPPORTED
     })?;
-    let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
     let mut doc: Value = serde_json::from_slice(json).map_err(|_| Status::INVALID_PARAMETER)?;
     let mut history: Vec<ManifestRef> = Vec::new();
 
@@ -235,7 +245,10 @@ fn resolve_payload(json: &[u8]) -> Result<(Vec<u8>, [u8; 32], Option<String>), S
                 })?;
                 let (binary, digest, signed_args) = admit_payload(&p.url.0, &mode)?;
                 let opts = signed_args.or_else(|| {
-                    p.args.as_deref().filter(|a| !a.is_empty()).map(|a| a.join(" "))
+                    p.args
+                        .as_deref()
+                        .filter(|a| !a.is_empty())
+                        .map(|a| a.join(" "))
                 });
                 return Ok((binary, digest, opts));
             }
@@ -245,10 +258,9 @@ fn resolve_payload(json: &[u8]) -> Result<(Vec<u8>, [u8; 32], Option<String>), S
                     Status::INVALID_PARAMETER
                 })?;
                 let (murl, bytes, hash) = fetch_manifest(&m)?;
-                if history
-                    .iter()
-                    .any(|r| r.sha256.as_deref() == Some(hash.as_str()) && r.url.0 == [murl.clone()])
-                {
+                if history.iter().any(|r| {
+                    r.sha256.as_deref() == Some(hash.as_str()) && r.url.0 == [murl.clone()]
+                }) {
                     crate::slog!("stage0: manifest resolution cycle at {murl}");
                     return Err(Status::SECURITY_VIOLATION);
                 }
@@ -260,7 +272,11 @@ fn resolve_payload(json: &[u8]) -> Result<(Vec<u8>, [u8; 32], Option<String>), S
                 });
                 // Consume the pointer, then deep-merge the manifest fragment (manifest wins). The
                 // merged entry re-populates with a `payload` (stop) or a fresh `manifest` (delegate).
-                if let Some(e) = doc.get_mut("_stage1").and_then(|s| s.get_mut(arch)).and_then(Value::as_object_mut) {
+                if let Some(e) = doc
+                    .get_mut("_stage1")
+                    .and_then(|s| s.get_mut(arch))
+                    .and_then(Value::as_object_mut)
+                {
                     e.remove("manifest");
                 }
                 let manifest_doc: Value = serde_json::from_slice(&bytes).map_err(|_| {
@@ -303,11 +319,14 @@ fn try_fetch_manifest(m: &ManifestRef, url: &str) -> Result<(Vec<u8>, String), S
         None => alloc::vec![alloc::format!("{url}.sig")],
     };
     let signature = download_first(&sig_urls)?;
-    sig::verify(&m.ed25519, sig::Domain::Stage1Manifest, &bytes, &signature).map_err(|e| {
+    sig::verify(&m.ed25519, sig::Domain::Manifest, &bytes, &signature).map_err(|e| {
         crate::slog!("stage0: manifest verification failed: {e}");
         Status::SECURITY_VIOLATION
     })?;
-    crate::slog!("stage0: manifest verified: sha256:{hash} (ed25519 key:{})", m.ed25519);
+    crate::slog!(
+        "stage0: manifest verified: sha256:{hash} (ed25519 key:{})",
+        m.ed25519
+    );
     Ok((bytes, hash))
 }
 
@@ -332,7 +351,7 @@ fn deep_merge(base: &mut Value, overlay: &Value) {
 /// Try each payload URL until one downloads and admits (content is pinned, so any mirror
 /// that yields verifying bytes is acceptable). Returns the bytes, their SHA-256 digest,
 /// and any verified signed load options.
-fn admit_payload(urls: &[String], mode: &Admit) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+fn admit_payload(urls: &[String], mode: &Admit) -> Admitted {
     let mut last = Status::NOT_FOUND;
     for url in urls {
         match admit_from(url, mode) {
@@ -347,7 +366,7 @@ fn admit_payload(urls: &[String], mode: &Admit) -> Result<(Vec<u8>, [u8; 32], Op
 }
 
 /// Download one payload candidate and run admission control (a gate — never measured).
-fn admit_from(url: &str, mode: &Admit) -> Result<(Vec<u8>, [u8; 32], Option<String>), Status> {
+fn admit_from(url: &str, mode: &Admit) -> Admitted {
     crate::sdbg!("stage0:   downloading payload from {url}");
     let binary = http::download(url)?;
     crate::slog!("stage0: payload: {} bytes from {url}", binary.len());
@@ -362,7 +381,12 @@ fn admit_from(url: &str, mode: &Admit) -> Result<(Vec<u8>, [u8; 32], Option<Stri
             }
             crate::slog!("stage0: verified: sha256:{hash} (sha256 pin)");
         }
-        Admit::Ed25519 { pubkey, sig_url, args_url, args_sig_url } => {
+        Admit::Ed25519 {
+            pubkey,
+            sig_url,
+            args_url,
+            args_sig_url,
+        } => {
             // Detached signature: the `sig_url` templates with `{sha256}` replaced by the
             // payload digest (content-addressable), else `<url>.sig` (co-located per mirror).
             let sig_urls = match sig_url {
@@ -370,13 +394,18 @@ fn admit_from(url: &str, mode: &Admit) -> Result<(Vec<u8>, [u8; 32], Option<Stri
                 None => alloc::vec![alloc::format!("{url}.sig")],
             };
             let signature = download_first(&sig_urls)?;
-            sig::verify(pubkey, sig::Domain::Stage1Uki, &binary, &signature).map_err(|m| {
+            sig::verify(pubkey, sig::Domain::Uki, &binary, &signature).map_err(|m| {
                 crate::slog!("stage0: ed25519 verification failed: {m}");
                 Status::SECURITY_VIOLATION
             })?;
             crate::slog!("stage0: verified: sha256:{hash} (ed25519 key:{pubkey})");
             if let Some(au) = args_url {
-                signed_args = Some(fetch_signed_args(&au.0, args_sig_url.as_ref(), pubkey, &hash)?);
+                signed_args = Some(fetch_signed_args(
+                    &au.0,
+                    args_sig_url.as_ref(),
+                    pubkey,
+                    &hash,
+                )?);
             }
         }
     }
@@ -396,11 +425,14 @@ fn fetch_signed_args(
     let args_urls = substitute(args_urls, payload_hash);
     let sig_urls = match args_sig_url {
         Some(u) => substitute(&u.0, payload_hash),
-        None => args_urls.iter().map(|u| alloc::format!("{u}.sig")).collect(),
+        None => args_urls
+            .iter()
+            .map(|u| alloc::format!("{u}.sig"))
+            .collect(),
     };
     let args = download_first(&args_urls)?;
     let sig = download_first(&sig_urls)?;
-    sig::verify(pubkey, sig::Domain::Stage1Args, &args, &sig).map_err(|m| {
+    sig::verify(pubkey, sig::Domain::Args, &args, &sig).map_err(|m| {
         crate::slog!("stage0: signed args verification failed: {m}");
         Status::SECURITY_VIOLATION
     })?;
