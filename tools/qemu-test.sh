@@ -50,6 +50,8 @@ Options:
                            (a sibling <payload>.sig is served too if present).
   --serve-dir <path>       Serve this whole directory at http://10.0.2.1:8000/
                            instead of a single payload (e.g. UKI + stage2).
+  --forward <port>         Forward a host TCP port to the guest (10.0.2.10).
+                           Repeatable (e.g. --forward 8402 --forward 9090).
   --trace                  Capture guest TCP on tap0 to a pcap (see --trace-file).
   --trace-file <path>      pcap output path (default: ./stage0-trace.pcap).
   -h, --help               Show this help.
@@ -69,6 +71,7 @@ PAYLOAD=""
 SERVE_DIR=""
 TRACE=0
 TRACE_FILE=""
+FORWARD_PORTS=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -81,6 +84,7 @@ while [ $# -gt 0 ]; do
         --serve-dir)  SERVE_DIR="$2"; shift 2 ;;
         --trace)      TRACE=1; shift ;;
         --trace-file) TRACE_FILE="$2"; shift 2 ;;
+        --forward)    FORWARD_PORTS+=("$2"); shift 2 ;;
         -h|--help)    usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
@@ -230,10 +234,13 @@ trap cleanup EXIT INT TERM
 
 echo "Press Ctrl-A, then X to exit QEMU"
 
-# --- Guest network: tap0 (10.0.2.1 gw + 169.254.169.254 IMDS), NAT out ------
+# --- Guest network: tap0 (gateway + 169.254.169.254 IMDS), NAT out -----------
+GUEST_GW=10.0.2.1
+GUEST_IP=10.0.2.10
+
 ip tuntap add dev tap0 mode tap
 ip link set tap0 up
-ip addr add 10.0.2.1/24 dev tap0
+ip addr add ${GUEST_GW}/24 dev tap0
 ip addr add 169.254.169.254/24 dev tap0
 
 if [ "${TRACE}" = 1 ]; then
@@ -265,27 +272,33 @@ fi
 if [ -n "${SERVE_ROOT}" ]; then
     # HTTP/1.1 (Content-Length + keep-alive). The stdlib default is HTTP/1.0
     # Connection: close, which OVMF's HttpDxe never completes the response token for.
-    ( cd "${SERVE_ROOT}" && exec python3 -c 'import http.server; http.server.SimpleHTTPRequestHandler.protocol_version="HTTP/1.1"; http.server.ThreadingHTTPServer(("10.0.2.1",8000), http.server.SimpleHTTPRequestHandler).serve_forever()' ) &
+    ( cd "${SERVE_ROOT}" && exec python3 -c "import http.server; http.server.SimpleHTTPRequestHandler.protocol_version='HTTP/1.1'; http.server.ThreadingHTTPServer(('${GUEST_GW}',8000), http.server.SimpleHTTPRequestHandler).serve_forever()" ) &
     echo $! > "${TMP}/payload-http.pid"
-    echo "Serving ${SERVE_ROOT} (HTTP/1.1) at http://10.0.2.1:8000/ :"
+    echo "Serving ${SERVE_ROOT} (HTTP/1.1) at http://${GUEST_GW}:8000/ :"
     ls -l "${SERVE_ROOT}" | sed 's/^/  /'
 fi
 
 echo 1 > /proc/sys/net/ipv4/ip_forward
 iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 
+for fwd_port in "${FORWARD_PORTS[@]}"; do
+    iptables -t nat -A PREROUTING -i eth0 -p tcp --dport "${fwd_port}" -j DNAT --to-destination ${GUEST_IP}:"${fwd_port}"
+    iptables -A FORWARD -i eth0 -p tcp -d ${GUEST_IP} --dport "${fwd_port}" -j ACCEPT
+    echo "Forwarding port ${fwd_port} -> ${GUEST_IP}:${fwd_port}"
+done
+
 # dnsmasq: EC2-style DHCP/DNS (gateway, DNS, classless route to IMDS, hostnames),
 # plus payload.lockboot.test -> 10.0.2.1 so hostname URLs exercise EFI_DNS4.
 {
-    for i in $(seq 10 20); do echo "10.0.2.${i} ip-10-0-2-${i}"; done
-    echo "10.0.2.1 payload.lockboot.test"
+    echo "${GUEST_IP} ip-${GUEST_IP//./-}"
+    echo "${GUEST_GW} payload.lockboot.test"
 } > "${TMP}/dnsmasq-hosts"
 dnsmasq --interface=tap0 --bind-interfaces \
-    --dhcp-range=10.0.2.10,10.0.2.20,12h \
-    --dhcp-option=3,10.0.2.1 \
-    --dhcp-option=6,10.0.2.1,8.8.8.8 \
+    --dhcp-range=${GUEST_IP},${GUEST_IP},12h \
+    --dhcp-option=3,${GUEST_GW} \
+    --dhcp-option=6,${GUEST_GW},8.8.8.8 \
     --dhcp-option=15,ec2.internal \
-    --dhcp-option=option:classless-static-route,169.254.169.254/32,10.0.2.1 \
+    --dhcp-option=option:classless-static-route,169.254.169.254/32,${GUEST_GW} \
     --dhcp-option=119,ec2.internal,local.compute.internal \
     --domain=ec2.internal \
     --expand-hosts \
