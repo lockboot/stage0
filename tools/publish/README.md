@@ -20,7 +20,7 @@ Each publisher reads the per-arch build output:
 | `build/<arch>/os-release` | both | names/tags the image (`ID`, `VERSION_ID`, `BUILD_ID`) |
 | `build/<arch>/{PK,KEK,db}.cer` | GCP | custom Secure Boot keys |
 
-Produce them with `make build-<arch>`. Or pass a `stage0-v*` release tag as the
+Produce them with `make build-<arch>`. Or pass a `v*` release tag as the
 `version` argument (instead of the default `local`) to download and
 attestation-verify the published release artifacts.
 
@@ -46,7 +46,7 @@ ec2/create.sh  [--region R]               [--public|--private] [--no-verify] [--
 gcp/create.sh  [--project P] [--region R] [--public|--private] [--no-verify] [--manifest F] <arch> [version]
 ```
 
-- `<arch>` is `x86_64` or `aarch64`; `version` is `local` (default) or a `stage0-v*` tag.
+- `<arch>` is `x86_64` or `aarch64`; `version` is `local` (default) or a `v*` tag.
 - `--region` default: `ap-southeast-1` (AWS, Singapore) / `asia-southeast1`
   (GCP, Singapore). Singapore is the always-on default; KL `ap-southeast-5` works
   but is an opt-in region you must enable on the account first.

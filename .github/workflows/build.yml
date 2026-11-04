@@ -3,8 +3,8 @@ name: build
 on:
   push:
     branches: [main]
-    # stage0 is the db-signed root of trust; tag stage0-v* to cut a release.
-    tags: ['stage0-v*']
+    # stage0 is the db-signed root of trust; tag v* to cut a release.
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -49,11 +49,11 @@ jobs:
             build/${{ matrix.arch }}/*.guid
           if-no-files-found: error
 
-  # ---- Release track (tag: stage0-v*) --------------------------------------
+  # ---- Release track (tag: v*) --------------------------------------
   release-stage0:
     runs-on: ubuntu-latest
     needs: build
-    if: startsWith(github.ref, 'refs/tags/stage0-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
       id-token: write
@@ -95,7 +95,7 @@ jobs:
           generate_release_notes: true
           make_latest: true
 
-  # ---- QEMU test-harness image (tag: stage0-v*) -----------------------------
+  # ---- QEMU test-harness image (tag: v*) -----------------------------
   # End-user harness: qemu + swtpm + OVMF/AAVMF + the EC2 metadata mock, qemu-test.sh as entrypoint.
   # Published with the stage0 release it ships beside: its firmware boots that release's efi-vars.
   # Multi-arch so it runs identically on amd64 and arm64 hosts (KVM when host == guest arch, TCG
@@ -103,7 +103,7 @@ jobs:
   release-harness:
     runs-on: ubuntu-latest
     needs: release-stage0
-    if: startsWith(github.ref, 'refs/tags/stage0-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
       packages: write

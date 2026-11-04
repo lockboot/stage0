@@ -22,7 +22,7 @@ Build (or download) a stage0 boot disk and register it as an AMI.
 
 Arguments:
   arch       x86_64 | aarch64
-  version    a stage0-v* release tag, or 'local' (default) for a local build
+  version    a v* release tag, or 'local' (default) for a local build
 
 Options:
   --region <r>  AWS region (default: ${DEFAULT_REGION})
@@ -41,7 +41,7 @@ Options:
 
 Examples:
   $(basename "$0") x86_64                          # local build -> public AMI in ${DEFAULT_REGION}
-  $(basename "$0") --region us-east-1 x86_64 stage0-v0.1.0
+  $(basename "$0") --region us-east-1 x86_64 v0.1.0
   $(basename "$0") --private aarch64
 EOF
 }

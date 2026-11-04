@@ -23,7 +23,7 @@ Build (or download) a stage0 boot disk and create a GCP image from it.
 
 Arguments:
   arch       x86_64 | aarch64
-  version    a stage0-v* release tag, or 'local' (default) for a local build
+  version    a v* release tag, or 'local' (default) for a local build
 
 Options:
   --project <p>  GCP project (default: active gcloud project)
@@ -38,7 +38,7 @@ Options:
 
 Examples:
   $(basename "$0") x86_64                          # active project, public image in ${DEFAULT_REGION}
-  $(basename "$0") --project my-proj x86_64 stage0-v0.1.0
+  $(basename "$0") --project my-proj x86_64 v0.1.0
   $(basename "$0") --private aarch64
 EOF
 }
