@@ -20,13 +20,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP=/tmp
 
-# EC2 metadata mock (downloaded + sha256-verified on first run; cached next to the
-# script, override the cache dir with EC2_MOCK_CACHE).
+# Host arch (where QEMU runs), as opposed to ARCH (the guest). Both amd64 and arm64 hosts are
+# supported for both guests: KVM when they match, TCG emulation otherwise.
+HOST_ARCH="$(uname -m)"
+case "${HOST_ARCH}" in
+    x86_64)  AEMM_ARCH=amd64; AEMM_SHA256="4f89ddc71ac53ce540bda1f9c340526d558eed8e41349761f2798acf1b254950" ;;
+    aarch64) AEMM_ARCH=arm64; AEMM_SHA256="9dae5b5849365dbaa133309da81f49bafe94ec0aa7e6b05ce3eb7a8f151c2217" ;;
+    *) echo "Error: unsupported host arch ${HOST_ARCH} (need x86_64 or aarch64)" >&2; exit 1 ;;
+esac
+
+# EC2 metadata mock for the host arch (downloaded + sha256-verified on first run; cached next to
+# the script, override the cache dir with EC2_MOCK_CACHE).
 AEMM_VERSION="v1.13.0"
-AEMM_URL="https://github.com/aws/amazon-ec2-metadata-mock/releases/download/${AEMM_VERSION}/ec2-metadata-mock-linux-amd64"
-AEMM_SHA256="4f89ddc71ac53ce540bda1f9c340526d558eed8e41349761f2798acf1b254950"
+AEMM_URL="https://github.com/aws/amazon-ec2-metadata-mock/releases/download/${AEMM_VERSION}/ec2-metadata-mock-linux-${AEMM_ARCH}"
 EC2_MOCK_CACHE="${EC2_MOCK_CACHE:-${SCRIPT_DIR}}"
-AMMM="${EC2_MOCK_CACHE}/ec2-metadata-mock-linux-amd64"
+AMMM="${EC2_MOCK_CACHE}/ec2-metadata-mock-linux-${AEMM_ARCH}"
 
 usage() {
     cat <<'EOF'
@@ -186,7 +194,8 @@ if [ "${ARCH}" = "x86_64" ]; then
     QEMU_CMD="qemu-system-x86_64"
     QEMU_MACHINE="-machine q35,smm=on"
     QEMU_CPU=""
-    QEMU_EXTRA="-enable-kvm"
+    # KVM on a matching host (unchanged: fails loudly without /dev/kvm); TCG on an arm64 host.
+    [ "${HOST_ARCH}" = "x86_64" ] && QEMU_EXTRA="-enable-kvm" || QEMU_EXTRA=""
     QEMU_SERIAL="-serial none"
     QEMU_SERIAL_DEVICE="-device isa-serial,chardev=char0"
     TPM_DEVICE="tpm-tis"
@@ -194,9 +203,16 @@ if [ "${ARCH}" = "x86_64" ]; then
 else
     OVMF_CODE="/usr/share/AAVMF/AAVMF_CODE.fd"
     QEMU_CMD="qemu-system-aarch64"
-    QEMU_MACHINE="-machine virt"
-    QEMU_CPU="-cpu cortex-a72"
-    QEMU_EXTRA=""
+    if [ "${HOST_ARCH}" = "aarch64" ]; then
+        # KVM on a matching host: the guest takes the host's CPU + GIC.
+        QEMU_MACHINE="-machine virt,gic-version=host"
+        QEMU_CPU="-cpu host"
+        QEMU_EXTRA="-enable-kvm"
+    else
+        QEMU_MACHINE="-machine virt"
+        QEMU_CPU="-cpu cortex-a72"
+        QEMU_EXTRA=""
+    fi
     QEMU_SERIAL="-serial none"
     QEMU_SERIAL_DEVICE="-device pci-serial,id=serial0,chardev=char0"
     TPM_DEVICE="tpm-tis-device"
