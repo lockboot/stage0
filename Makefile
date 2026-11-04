@@ -132,9 +132,10 @@ build/%/args.json.sig: build/keys/release.pem | sign-bin
 
 # ---- QEMU harness: the lean harness image bakes qemu-test.sh as its entrypoint
 # (and the EC2_MOCK_CACHE + iptables-ack env), so we just append CLI args. ----
+# HARNESS_TIMEOUT=<s> bounds each boot (qemu-test.sh --timeout); unset = no limit.
 STAGE0_QEMU = $(DOCKER_RUN) $(DOCKER_OPT_KVM) \
 	--cap-add=NET_ADMIN --device=/dev/net/tun \
-	$(HARNESS_IMAGE)
+	$(HARNESS_IMAGE) $(if $(HARNESS_TIMEOUT),--timeout $(HARNESS_TIMEOUT))
 
 # Boot stage0 under QEMU. Serves a staging dir (so payload, signed args, and a signed
 # manifest are all served uniformly at http://SERVE_HOST/<file>) and regenerates the
@@ -219,6 +220,17 @@ smoke-boot-%: build/%/boot.disk build/%/payload.efi build/%/args.json.sig docker
 	if [ "$$fail" = 0 ]; then echo "ALL STAGE0 BOOT TESTS PASSED"; else echo "SOME STAGE0 BOOT TESTS FAILED"; exit 1; fi
 
 smoke-boot: smoke-boot-$(ARCH)
+
+# ---- Self-test: stage0's part of the workspace `make selftest` (PASS/FAIL, non-zero on FAIL).
+# The boot-test matrix above, with every boot time-bounded so a hang fails instead of blocking.
+# One bound for both arches (~3x the slowest measured boot; aarch64 is TCG-emulated but fast).
+SELFTEST_TIMEOUT_x86_64  ?= 300
+SELFTEST_TIMEOUT_aarch64 ?= 300
+.PHONY: selftest
+selftest:
+	@echo "needs an arch suffix, e.g. 'make selftest-x86_64'." >&2; exit 2
+selftest-%:
+	$(MAKE) --no-print-directory smoke-boot-$* HARNESS_TIMEOUT=$(SELFTEST_TIMEOUT_$*)
 
 # Arch-less convenience forms target the host architecture ($(ARCH)).
 .PHONY: build boot test

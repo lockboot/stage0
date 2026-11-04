@@ -60,6 +60,8 @@ Options:
                            instead of a single payload (e.g. UKI + stage2).
   --forward <port>         Forward a host TCP port to the guest (10.0.2.10).
                            Repeatable (e.g. --forward 8402 --forward 9090).
+  --timeout <seconds>      Kill QEMU if the guest has not powered off by then, and
+                           exit 124 (default: 0 = no limit). For unattended runs.
   --trace                  Capture guest TCP on tap0 to a pcap (see --trace-file).
   --trace-file <path>      pcap output path (default: ./stage0-trace.pcap).
   -h, --help               Show this help.
@@ -80,6 +82,7 @@ SERVE_DIR=""
 TRACE=0
 TRACE_FILE=""
 FORWARD_PORTS=()
+TIMEOUT=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -93,6 +96,7 @@ while [ $# -gt 0 ]; do
         --trace)      TRACE=1; shift ;;
         --trace-file) TRACE_FILE="$2"; shift 2 ;;
         --forward)    FORWARD_PORTS+=("$2"); shift 2 ;;
+        --timeout)    TIMEOUT="$2"; shift 2 ;;
         -h|--help)    usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
@@ -215,7 +219,11 @@ else
         QEMU_CPU="-cpu cortex-a72"
         QEMU_EXTRA=""
     fi
-    QEMU_SERIAL="-serial none"
+    # The virt board's PL011 carries AAVMF's UEFI ConOut (stage0's output). Attach it to the same
+    # muxed stdio as the pci-serial (ttyS0, where /dev/console lands) so the whole chain -- UEFI,
+    # kernel, init, userspace -- is captured, as it is on x86 via isa-serial. Kernel printk then
+    # appears on both (console=ttyAMA0 console=ttyS0), i.e. twice in this log.
+    QEMU_SERIAL="-serial chardev:char0"
     QEMU_SERIAL_DEVICE="-device pci-serial,id=serial0,chardev=char0"
     TPM_DEVICE="tpm-tis-device"
     PFLASH_SECURE=""
@@ -323,8 +331,13 @@ dnsmasq --interface=tap0 --bind-interfaces \
     --addn-hosts="${TMP}/dnsmasq-hosts" \
     --log-queries
 
+# --timeout: bound an unattended run. A guest that never powers off is a failure, not a hang.
+QEMU_WRAP=()
+[ "${TIMEOUT}" != 0 ] && QEMU_WRAP=(timeout --foreground --kill-after=10 "${TIMEOUT}")
+QEMU_RC=0
+
 # shellcheck disable=SC2086
-${QEMU_CMD} \
+"${QEMU_WRAP[@]}" ${QEMU_CMD} \
     ${QEMU_CPU} \
     ${QEMU_EXTRA} \
     ${QEMU_MACHINE} \
@@ -344,4 +357,9 @@ ${QEMU_CMD} \
     -chardev stdio,mux=on,id=char0 \
     ${QEMU_SERIAL_DEVICE} \
     -drive "if=pflash,format=raw,unit=0,file=${OVMF_CODE},readonly=on" \
-    -drive "if=pflash,format=raw,unit=1,file=${OVMF_VARS}" || true
+    -drive "if=pflash,format=raw,unit=1,file=${OVMF_VARS}" || QEMU_RC=$?
+
+if [ "${TIMEOUT}" != 0 ] && { [ "${QEMU_RC}" = 124 ] || [ "${QEMU_RC}" = 137 ]; }; then
+    echo "qemu-test: TIMEOUT: guest did not power off within ${TIMEOUT}s" >&2
+    exit 124
+fi
