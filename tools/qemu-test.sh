@@ -156,7 +156,9 @@ provision_tpm() {
     tpm2_startup -c
 
     local NV_ECC_CERT=0x01c10002 NV_ECC_TEMPLATE=0x01c10003
-    if tpm2_nvreadpublic ${NV_ECC_TEMPLATE} >/dev/null 2>&1; then
+    # Probe via the NV handle list: tpm2-tools 5.4's tpm2_nvreadpublic SEGFAULTs on an undefined
+    # index (exit 139), which dumped a root-owned `core` into the caller's cwd on every fresh boot.
+    if tpm2_getcap handles-nv-index | grep -qix -- "- $(printf '0x%X' $((NV_ECC_TEMPLATE)))"; then
         echo "vTPM already provisioned, skipping."
         tpm2_shutdown; swtpm_ioctl --unix "${sock}.ctrl" -s; rm -rf "${work}"; return
     fi
