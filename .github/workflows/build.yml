@@ -73,12 +73,27 @@ jobs:
             gh api repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip > stage0-${arch}.zip
           done
 
-      - name: Attest stage0 zips
+      # One attestation covering the release zips, every file inside them, and the released
+      # harness script. Consumers can verify a zip and extract from it, or verify an extracted file
+      # on its own (`gh attestation verify BOOTX64.EFI --repo ...`). Subjects are named via a
+      # checksums file so the per-arch copies of same-named files stay distinguishable
+      # (x86_64/... vs aarch64/...); verification itself matches by digest.
+      - name: List attestation subjects (zips + their contents + qemu-test.sh)
+        run: |
+          for arch in x86_64 aarch64; do
+            mkdir -p "contents/$arch" && unzip -q "stage0-$arch.zip" -d "contents/$arch"
+          done
+          {
+            sha256sum stage0-x86_64.zip stage0-aarch64.zip
+            (cd tools && sha256sum qemu-test.sh)
+            (cd contents && find . -type f -printf '%P\n' | LC_ALL=C sort | xargs -r -d '\n' sha256sum)
+          } > subjects.sha256
+          cat subjects.sha256
+
+      - name: Attest stage0 zips, their contents, and qemu-test.sh
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
-          subject-path: |
-            stage0-x86_64.zip
-            stage0-aarch64.zip
+          subject-checksums: subjects.sha256
 
       - name: Create stage0 release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
