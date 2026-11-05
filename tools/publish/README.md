@@ -114,8 +114,8 @@ is reused):
 - `SEV_CAPABLE`, `SEV_SNP_CAPABLE` — x86_64 only; mark the image launchable as an AMD
   SEV / SEV-SNP Confidential VM.
 - `GVNIC` — Google Virtual NIC.
-- aarch64 gets `UEFI_COMPATIBLE` + `GVNIC` only (ARM confidential compute needs no
-  guest-OS feature flag).
+- aarch64 gets `UEFI_COMPATIBLE` + `GVNIC` only (GCP documents no Arm Confidential VM
+  series; t2a launches as a Shielded VM).
 
 We create the image directly from GCS rather than `gcloud compute images import`
 because `import` demands a predefined `--os` (e.g. `ubuntu-2204`) and won't set custom
@@ -124,11 +124,15 @@ guest-OS features — stage0 is kernel-less, so there is no OS for it to detect.
 **Trust-model requirement:** Confidential VMs must run with
 `--maintenance-policy=TERMINATE` (no live migration — migration would expose decrypted
 guest memory to the hypervisor). Never enable the `SEV_LIVE_MIGRATABLE` feature.
-`launch-instance.sh` bakes this in along with `--confidential-compute`,
-`--shielded-secure-boot`, `--shielded-vtpm`, and `--shielded-integrity-monitoring`.
+`launch-instance.sh` bakes this in along with the per-family `--confidential-compute-type`,
+`--shielded-secure-boot`, `--shielded-vtpm`, `--shielded-integrity-monitoring`, and
+`--no-service-account --no-scopes` (the guest never calls GCP APIs, so it gets no credentials).
 
-Confidential VM machine types: `n2d-standard-*` (SEV / SEV-SNP), `c2d-standard-*`
-(SEV-SNP, compute-optimized), `c3-standard-*` (Intel TDX), `t2a-standard-*` (ARM64).
+Machine types `launch-instance.sh` accepts: `n2d-standard-*` (SEV-SNP, pinned to
+`--min-cpu-platform="AMD Milan"`), `c2d-standard-*` (SEV), `c3-standard-*` (Intel TDX),
+`t2a-standard-*` (ARM64, Shielded VM only; pass e.g. `--confidential-compute-type=CCA` as a
+trailing option to experiment). Pass `--manifest <f>` first to record the instance for
+`cleanup.sh` -- GCP instances keep running (and billing) after stage0 powers off.
 
 How GCP differs from EC2 here: GCP manages the Secure Boot vars and vTPM itself (no
 `--uefi-data` / `--tpm-support`), memory is encrypted by SEV/SEV-SNP/TDX, and the

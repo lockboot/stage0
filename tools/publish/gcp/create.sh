@@ -154,7 +154,10 @@ source "${OS_RELEASE_FILE}"
 
 VERSION_DASH=$(echo "${VERSION_ID}" | tr '.' '-')
 ARCH_DASH=$(echo "${ARCH}" | tr '_' '-')
-IMAGE_NAME="${ID}-${ARCH_DASH}-${VERSION_DASH}"           # GCP names: lowercase/digits/hyphens
+# GCP names: lowercase/digits/hyphens. BUILD_ID is part of the name (as for the EC2 AMI) so
+# re-running after a rebuild -- new keys/binary, same VERSION_ID -- makes a new image instead of
+# silently reusing a stale one.
+IMAGE_NAME="${ID}-${ARCH_DASH}-${VERSION_DASH}-${BUILD_ID}"
 IMAGE_DESC="${PRETTY_NAME} version: ${VERSION_ID} build: ${BUILD_ID} arch: ${ARCH}"
 IMAGE_FAMILY="${ID}"
 
@@ -198,8 +201,10 @@ else
         ${GCLOUD} storage cp "${TEMP_DIR}/${BUILD_ID}.tar.gz" "${GCS_URI}" --project="${PROJECT}" \
             --custom-metadata="version-id=${VERSION_ID},build-id=${BUILD_ID},name=${NAME},pretty-name=${PRETTY_NAME},id=${ID},arch=${ARCH}" \
             || die "GCS upload failed"
+        # Recorded only when THIS run created it: a reused object may belong to an earlier
+        # session and must not be swept by this run's teardown.
+        record "gcp gcsobject ${PROJECT} ${GCS_URI}"
     fi
-    record "gcp gcsobject ${PROJECT} ${GCS_URI}"
 
     echo "=== Creating image ${IMAGE_NAME} (${GCP_ARCH}, ${GUEST_OS_FEATURES}) ==="
     ${GCLOUD} compute images create "${IMAGE_NAME}" --project="${PROJECT}" \
@@ -210,8 +215,8 @@ else
         --signature-database-file="${KEYS_DIR}/db.cer" \
         || die "image create failed"
     IMAGE_FINAL="${IMAGE_NAME}"
+    record "gcp image ${PROJECT} ${IMAGE_FINAL}"   # only when created by this run
 fi
-record "gcp image ${PROJECT} ${IMAGE_FINAL}"
 
 # Make the image publicly launchable (default; --private opts out): any authenticated
 # GCP user can create instances from it (per-customer config lives in user-data).
@@ -235,7 +240,7 @@ echo ""
 
 DEFAULT_ZONE=$(${GCLOUD} config get-value compute/zone 2>/dev/null || echo "")
 [ -n "${DEFAULT_ZONE}" ] || DEFAULT_ZONE="${REGION}-a"
-if [ "${ARCH}" = "aarch64" ]; then MACHINE_TYPE="t2a-standard-1"; TECH="ARM TrustZone"; else MACHINE_TYPE="n2d-standard-2"; TECH="AMD SEV-SNP"; fi
+if [ "${ARCH}" = "aarch64" ]; then MACHINE_TYPE="t2a-standard-1"; TECH="Shielded VM, no confidential type"; else MACHINE_TYPE="n2d-standard-2"; TECH="AMD SEV-SNP"; fi
 
 echo "Launch a Confidential VM (${TECH}):"
 echo "  ${SCRIPT_DIR}/launch-instance.sh my-instance ${DEFAULT_ZONE} ${MACHINE_TYPE} ${IMAGE_FINAL} config.json"

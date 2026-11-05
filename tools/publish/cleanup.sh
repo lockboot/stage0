@@ -5,9 +5,11 @@
 # snapshot still settling) are warnings, not fatal, so this is safe to re-run.
 #
 # Manifest line format: "<provider> <kind> <region-or-project> <id-or-uri>"
+#   aws instance  <region>   i-xxxx          (ec2/launch.sh --manifest)
 #   aws ami       <region>   ami-xxxx
 #   aws snapshot  <region>   snap-xxxx
 #   aws s3object  <region>   s3://bucket/key
+#   gcp instance  <project>  <zone>/<name>   (gcp/launch-instance.sh --manifest)
 #   gcp image     <project>  image-name
 #   gcp gcsobject <project>  gs://bucket/path
 
@@ -27,7 +29,7 @@ Options:
   --dry-run    print the delete commands without running them
   -h, --help   show this help and exit
 
-Handles: aws {ami,snapshot,s3object}, gcp {image,gcsobject}.
+Handles: aws {instance,ami,snapshot,s3object}, gcp {instance,image,gcsobject}.
 EOF
 }
 
@@ -56,9 +58,11 @@ for (( i=${#LINES[@]}-1; i>=0; i-- )); do
     [ -n "${id:-}" ] || { warn "malformed line: ${line}"; skipped=$((skipped+1)); continue; }
 
     case "${provider} ${kind}" in
+        "aws instance")  cli=aws;    cmd=(aws ec2 terminate-instances --instance-ids "${id}" --region "${ctx}") ;;
         "aws ami")       cli=aws;    cmd=(aws ec2 deregister-image --image-id "${id}" --region "${ctx}") ;;
         "aws snapshot")  cli=aws;    cmd=(aws ec2 delete-snapshot --snapshot-id "${id}" --region "${ctx}") ;;
         "aws s3object")  cli=aws;    cmd=(aws s3 rm "${id}") ;;
+        "gcp instance")  cli=gcloud; cmd=(gcloud compute instances delete "${id#*/}" --zone "${id%%/*}" --project "${ctx}" --quiet) ;;
         "gcp image")     cli=gcloud; cmd=(gcloud compute images delete "${id}" --project "${ctx}" --quiet) ;;
         "gcp gcsobject") cli=gcloud; cmd=(gcloud storage rm "${id}" --project "${ctx}") ;;
         *) warn "unknown resource: ${line}"; skipped=$((skipped+1)); continue ;;

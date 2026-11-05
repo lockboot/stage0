@@ -181,8 +181,10 @@ else
     echo "Snapshot created: ${SNAPSHOT_ID}"
     aws ec2 create-tags --region "${REGION}" --resources "${SNAPSHOT_ID}" \
         --tags "Key=Name,Value=${SNAPSHOT_DESC}" "Key=BuildID,Value=${BUILD_ID}" "Key=VersionID,Value=${VERSION_ID}"
+    # Recorded only when THIS run created it: a reused snapshot/AMI may belong to an earlier
+    # session and must not be swept by this run's teardown.
+    record "aws snapshot ${REGION} ${SNAPSHOT_ID}"
 fi
-record "aws snapshot ${REGION} ${SNAPSHOT_ID}"
 
 echo "=== Checking for existing AMI ==="
 EXISTING_AMI=$(aws ec2 describe-images --region "${REGION}" --owners self \
@@ -212,8 +214,8 @@ else
     echo "AMI registered: ${AMI_ID}"
     aws ec2 create-tags --region "${REGION}" --resources "${AMI_ID}" \
         --tags "Key=Name,Value=${PRETTY_NAME}" "Key=BuildID,Value=${BUILD_ID}" "Key=VersionID,Value=${VERSION_ID}"
+    record "aws ami ${REGION} ${AMI_ID}"   # only when created by this run
 fi
-record "aws ami ${REGION} ${AMI_ID}"
 
 # Make the AMI publicly launchable (default; --private opts out): any AWS account
 # can launch it directly (per-customer config lives in user-data, not the image).

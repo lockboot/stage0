@@ -54,18 +54,20 @@ case "${MODE}" in
         echo "Following console output for ${INSTANCE_NAME} (Ctrl+C to stop)..."
         echo "---"
 
-        LAST_LINE=0
+        # --start is a BYTE index; resume from the `next` offset each response reports (it also
+        # stays correct if the serial buffer rolled over and older bytes were dropped).
+        command -v jq >/dev/null 2>&1 || { echo "Error: --follow needs jq"; exit 1; }
+        NEXT=0
         while true; do
-            OUTPUT=$(${GCLOUD} compute instances get-serial-port-output "${INSTANCE_NAME}" \
+            RESP=$(${GCLOUD} compute instances get-serial-port-output "${INSTANCE_NAME}" \
                 --zone="${ZONE}" \
                 --project="${PROJECT}" \
-                --start="${LAST_LINE}" 2>/dev/null || echo "")
+                --start="${NEXT}" --format=json 2>/dev/null || echo "")
 
-            if [ -n "${OUTPUT}" ]; then
-                echo "${OUTPUT}"
-                # Count total lines to update start position
-                NEW_LINES=$(echo "${OUTPUT}" | wc -l)
-                LAST_LINE=$((LAST_LINE + NEW_LINES))
+            if [ -n "${RESP}" ]; then
+                jq -j '.contents // ""' <<<"${RESP}"
+                N=$(jq -r '.next // empty' <<<"${RESP}")
+                [ -n "${N}" ] && NEXT="${N}"
             fi
 
             sleep 2
