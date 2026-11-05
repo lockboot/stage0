@@ -309,9 +309,10 @@ fn udp_recv(udp_ptr: *mut Udp4Protocol, budget_ms: u64) -> Result<Vec<u8>, Statu
         return Err(st);
     }
 
-    // Copy the datagram out of the (possibly fragmented) receive buffer. We do not
-    // signal RecycleSignal: this child handles one datagram and is then destroyed,
-    // which reclaims the buffer.
+    // Copy the datagram out of the (possibly fragmented) receive buffer, then hand it back
+    // by signalling RecycleSignal, as the UEFI spec requires. Destroying the child does NOT
+    // stand in for this: EDK2's Udp4Configure(NULL) ASSERTs the delivered-datagram queue is
+    // empty, and firmware built with ASSERTs enabled (GCP) resets the machine there.
     let out = unsafe {
         let rx = token.packet.rx_data;
         let mut buf = Vec::new();
@@ -331,6 +332,9 @@ fn udp_recv(udp_ptr: *mut Udp4Protocol, budget_ms: u64) -> Result<Vec<u8>, Statu
                     take,
                 ));
                 copied += take;
+            }
+            if let Some(recycle) = uefi::Event::from_ptr((*rx).recycle_signal) {
+                let _ = boot::signal_event(&recycle);
             }
         }
         buf
