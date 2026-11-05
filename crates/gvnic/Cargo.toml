@@ -1,0 +1,23 @@
+[package]
+name = "gvnic"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "UEFI SimpleNetworkProtocol driver for the Google Virtual NIC (gVNIC / gve)"
+
+# Standalone workspace like ena/stage0: only builds for *-unknown-uefi, kept out of any
+# parent workspace. Produces `gvnic.efi`, a resident UEFI boot-service driver that stage0
+# loads at runtime (GCP's UEFI firmware ships no gVNIC driver, and GCP requires gVNIC for
+# Confidential VMs and Arm). build.rs forces the EFI_BOOT_SERVICE_DRIVER PE subsystem so
+# the image stays resident.
+[workspace]
+
+[dependencies]
+uefi = { version = "0.35", features = ["alloc", "global_allocator", "panic_handler"] }
+uefi-raw = "0.11"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

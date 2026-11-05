@@ -53,17 +53,17 @@ sign-test: docker-build-base
 
 # ---- CI gate: fmt + clippy + unit tests across all crates (what the branch ruleset requires) ----
 # stage0 is not one cargo workspace: 4 independent crates in two target families. The EFI crates
-# (ena, stage0, stage0-test-payload) are no_std UEFI and not host-testable -> fmt + clippy on the
+# (ena, gvnic, stage0, stage0-test-payload) are no_std UEFI and not host-testable -> fmt + clippy on the
 # UEFI target; the host signer (stage0-sign) also runs its unit tests (incl. the golden vector).
-UEFI_CRATES := ena stage0 stage0-test-payload
+UEFI_CRATES := ena gvnic stage0 stage0-test-payload
 HOST_CRATES := stage0-sign
 .PHONY: ci fmt-fix
 fmt-fix: docker-build-base ## Apply rustfmt across all crates (no --check)
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c '\
 		for c in $(UEFI_CRATES) $(HOST_CRATES); do cargo fmt --manifest-path crates/$$c/Cargo.toml; done'
-# ena.efi is include_bytes!'d by the stage0 crate, so it must exist before clippy/check can
+# ena.efi + gvnic.efi are include_bytes!'d by the stage0 crate, so they must exist before clippy/check can
 # compile it (a clean CI checkout has no build/ artifacts; a warm local tree hid this).
-ci: docker-build-base build/x86_64/ena.efi
+ci: docker-build-base build/x86_64/ena.efi build/x86_64/gvnic.efi
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c '\
 		set -e; rustup target add x86_64-unknown-uefi x86_64-unknown-linux-musl; \
 		for c in $(UEFI_CRATES) $(HOST_CRATES); do \
@@ -93,12 +93,20 @@ build/%/ena.efi: docker-build-base
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
 		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path crates/ena/Cargo.toml --target $*-unknown-uefi && cp -v crates/ena/target/$*-unknown-uefi/release/ena.efi $@"
 
+# ---- Build the gvnic.efi UEFI driver (embedded into stage0 for GCP/gVNIC netboot) ----
+# Same shape as ena.efi, for the Google Virtual NIC: GCP's UEFI firmware ships no gVNIC
+# driver, and GCP requires gVNIC for Confidential VMs and Arm. Embedded unconditionally.
+.PRECIOUS: build/%/gvnic.efi
+build/%/gvnic.efi: docker-build-base
+	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
+		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path crates/gvnic/Cargo.toml --target $*-unknown-uefi && cp -v crates/gvnic/target/$*-unknown-uefi/release/gvnic.efi $@"
+
 # ---- Build the stage0 UEFI binary ----
 # mkdir runs inside the container (as DOCKER_SAMEUSER) so the output dir is owned
 # by the build user, not by the host caller (which is root under `gh act`).
-# stage0 include_bytes! build/$*/ena.efi unconditionally (one measured unit), so the
-# ena.efi prerequisite must be built first; nothing extra to pass on the command line.
-build/%/stage0.efi: build/%/ena.efi docker-build-base
+# stage0 include_bytes! build/$*/{ena,gvnic}.efi unconditionally (one measured unit), so the
+# driver prerequisites must be built first; nothing extra to pass on the command line.
+build/%/stage0.efi: build/%/ena.efi build/%/gvnic.efi docker-build-base
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
 		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path $(STAGE0_DIR)/Cargo.toml --target $*-unknown-uefi && cp -v $(STAGE0_DIR)/target/$*-unknown-uefi/release/stage0.efi $@"
 
