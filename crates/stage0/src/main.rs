@@ -87,12 +87,13 @@ fn run() -> Result<(), Status> {
     crate::slog!("stage0: version: {}", env!("CARGO_PKG_VERSION"));
 
     // Fail closed unless the platform is in the state the attestation model assumes: UEFI Secure
-    // Boot enabled AND Deployed Mode. Enforcing it here means "authentic stage0 ran" -- proven by
-    // stage0's pinned firmware measurement -- implies the SB/deployed state held, even on firmware
-    // that does not measure DeployedMode into PCR 7. State only: the release signing cert is
-    // ephemeral (unknown at build time), so key identity is bound by the per-provider/per-arch
-    // golden PCR set (PCR 7 == the db), not here.
-    require_secure_boot_deployed()?;
+    // Boot enforcing -- SecureBoot on, not in Setup Mode, not in Audit Mode. User and Deployed Mode
+    // are both accepted (GCP can only provision PK/KEK/db/dbx, so its firmware starts in User
+    // Mode). Enforcing it here means "authentic stage0 ran" -- proven by stage0's pinned firmware
+    // measurement -- implies enforcement held. State only: the release signing cert is ephemeral
+    // (unknown at build time), so key identity is bound by the per-provider/per-arch golden PCR
+    // set (PCR 7 == SecureBoot/PK/KEK/db/dbx), not here.
+    require_secure_boot_enforcing()?;
 
     // Bring the network up once (DHCP), then fetch metadata. Metadata and payload
     // both ride the raw-TCP4 HTTP client (http.rs).
@@ -145,23 +146,41 @@ fn run() -> Result<(), Status> {
     Ok(())
 }
 
-/// Fail-closed gate: require UEFI Secure Boot enabled AND Deployed Mode, both read straight from
-/// the firmware variables (reliable here, pre-ExitBootServices -- unlike later in Linux). Rejects
-/// if either is not exactly 1, or the variable is absent (Setup/User/Audit mode, or firmware that
-/// does not implement Deployed Mode -- in which case the platform cannot make the guarantee).
-fn require_secure_boot_deployed() -> Result<(), Status> {
+/// Fail-closed gate on the Secure Boot state, read straight from the firmware variables (reliable
+/// here, pre-ExitBootServices -- unlike later in Linux):
+///
+/// * `SecureBoot` must be exactly 1;
+/// * `SetupMode` must be exactly 0 (absent = cannot tell -> refuse);
+/// * `AuditMode` must be 0 or absent (absent: pre-UEFI-2.5 firmware, which has no Audit Mode).
+///
+/// That admits User Mode and Deployed Mode, the two modes where signature checks are enforced
+/// and the key databases can only change via PK/KEK-signed updates. Setup Mode (no PK, keys
+/// writable) and Audit Mode (violations logged, images run) are refused. The mode is logged.
+fn require_secure_boot_enforcing() -> Result<(), Status> {
     if global_var_u8(uefi::cstr16!("SecureBoot")) != Some(1) {
         crate::slog!("stage0: refusing to boot: UEFI Secure Boot is not enabled");
         return Err(Status::SECURITY_VIOLATION);
     }
-    if global_var_u8(uefi::cstr16!("DeployedMode")) != Some(1) {
-        crate::slog!("stage0: refusing to boot: platform is not in UEFI Deployed Mode");
+    if global_var_u8(uefi::cstr16!("SetupMode")) != Some(0) {
+        crate::slog!(
+            "stage0: refusing to boot: platform is in (or cannot rule out) UEFI Setup Mode"
+        );
         return Err(Status::SECURITY_VIOLATION);
     }
+    if !matches!(global_var_u8(uefi::cstr16!("AuditMode")), None | Some(0)) {
+        crate::slog!("stage0: refusing to boot: platform is in UEFI Audit Mode");
+        return Err(Status::SECURITY_VIOLATION);
+    }
+    let mode = match global_var_u8(uefi::cstr16!("DeployedMode")) {
+        Some(1) => "Deployed",
+        _ => "User",
+    };
+    crate::slog!("stage0: Secure Boot enforcing ({mode} Mode)");
     Ok(())
 }
 
-/// Read a one-byte UEFI global variable (`SecureBoot` / `DeployedMode` are UINT8). `None` if absent.
+/// Read a one-byte UEFI global variable (`SecureBoot` / `SetupMode` / `AuditMode` /
+/// `DeployedMode` are UINT8). `None` if absent.
 fn global_var_u8(name: &CStr16) -> Option<u8> {
     let mut buf = [0u8; 1];
     runtime::get_variable(name, &VariableVendor::GLOBAL_VARIABLE, &mut buf)
