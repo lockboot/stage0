@@ -44,6 +44,8 @@ jobs:
             build/${{ matrix.arch }}/boot.disk
             build/${{ matrix.arch }}/BOOT*.EFI
             build/${{ matrix.arch }}/efi-vars.*
+            build/${{ matrix.arch }}/dbx.esl
+            build/${{ matrix.arch }}/dbx.auth.bin
             build/${{ matrix.arch }}/os-release
             build/${{ matrix.arch }}/*.cer
             build/${{ matrix.arch }}/*.guid

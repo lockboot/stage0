@@ -19,6 +19,7 @@ Each publisher reads the per-arch build output:
 | `build/<arch>/efi-vars.aws` | EC2 | AWS-format Secure Boot variable store (`--uefi-data`) |
 | `build/<arch>/os-release` | both | names/tags the image (`ID`, `VERSION_ID`, `BUILD_ID`) |
 | `build/<arch>/{PK,KEK,db}.cer` | GCP | custom Secure Boot keys |
+| `build/<arch>/dbx.auth.bin` | GCP | our dbx (the exact EFI_SIGNATURE_LIST in `efi-vars.*`, also shipped as `dbx.esl`) as a KEK-signed authenticated update -- the only form GCP's `BIN` dbx accepts at VM start |
 
 Produce them with `make build-<arch>`. Or pass a `v*` release tag as the
 `version` argument (instead of the default `local`) to download and
@@ -107,12 +108,14 @@ tools/publish/gcp/get-console.sh my-vm asia-southeast1-a --follow
 ```
 
 Uploads `boot.disk` as a `disk.raw` tarball to GCS and creates a global image with
-your custom PK/KEK/db and these guest-OS features (idempotent: an existing GCS upload
-is reused):
+your custom PK/KEK/db/dbx and these guest-OS features (idempotent: an existing GCS upload
+is reused). dbx is our own (`dbx.auth.bin`): left unset, GCP fills in its default Microsoft dbx,
+which makes PCR 7 depend on a list we don't control (and that changes over time).
+`--default-dbx` does exactly that, for A/B measurement only (separate `-defdbx` image):
 
 - `UEFI_COMPATIBLE` — required for UEFI boot.
-- `SEV_CAPABLE`, `SEV_SNP_CAPABLE` — x86_64 only; mark the image launchable as an AMD
-  SEV / SEV-SNP Confidential VM.
+- `SEV_CAPABLE`, `SEV_SNP_CAPABLE`, `TDX_CAPABLE` — x86_64 only; mark the image launchable
+  as an AMD SEV / SEV-SNP or Intel TDX Confidential VM.
 - `GVNIC` — Google Virtual NIC.
 - aarch64 gets `UEFI_COMPATIBLE` + `GVNIC` only (GCP documents no Arm Confidential VM
   series; t2a launches as a Shielded VM).

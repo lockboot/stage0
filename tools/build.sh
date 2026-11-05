@@ -104,7 +104,9 @@ python3 "${REPO_ROOT}/tools/mkvarstore.py" --arch "${ARCH}" \
   --kek "${KEYDIR}/KEK.crt" --kek-guid "${KEYDIR}/KEK.guid" \
   --db  "${KEYDIR}/db.crt"  --db-guid  "${KEYDIR}/db.guid" \
   --dict "${REPO_ROOT}/tools/firmware/amznuefi-v0.dict" \
-  --out-ovmf "${EFI_VARS_OVMF}" --out-aws "${EFI_VARS_AWS}"
+  --out-ovmf "${EFI_VARS_OVMF}" --out-aws "${EFI_VARS_AWS}" \
+  --out-dbx "${OUTPUT_DIR}/dbx.esl" \
+  --out-dbx-auth "${OUTPUT_DIR}/dbx.auth.bin" --kek-key "${KEYDIR}/KEK.crt.key"
 echo "EFI vars written: ${EFI_VARS_OVMF}"
 
 # Emit os-release so the cloud publishers can name/tag the image. BUILD_ID is

@@ -30,6 +30,8 @@ Options:
   --region <r>   GCS bucket / zone region (default: ${DEFAULT_REGION})
   --public       make the image usable by any authenticated GCP user (default)
   --private      keep the image private to this project
+  --default-dbx  TEST ONLY: omit our dbx so GCP fills in its default (Microsoft) dbx; for
+                 dbx A/B measurement runs. Creates a separate '-defdbx' image.
   --no-verify    (release mode) skip gh attestation; fetch the public release asset
                  via curl so no gh install is needed
   --manifest <f>  append created resources to <f> for a teardown script, one per
@@ -49,6 +51,7 @@ PROJECT=""
 REGION="${DEFAULT_REGION}"
 PUBLIC=true
 NO_VERIFY=false
+DEFAULT_DBX=false
 MANIFEST=""
 POSITIONAL=()
 while [ $# -gt 0 ]; do
@@ -60,6 +63,7 @@ while [ $# -gt 0 ]; do
         --public)     PUBLIC=true; shift ;;
         --private)    PUBLIC=false; shift ;;
         --no-verify)  NO_VERIFY=true; shift ;;
+        --default-dbx) DEFAULT_DBX=true; shift ;;
         --manifest)   MANIFEST="${2:?--manifest needs a value}"; shift 2 ;;
         --manifest=*) MANIFEST="${1#*=}"; shift ;;
         -h|--help)    usage; exit 0 ;;
@@ -147,6 +151,14 @@ fi
 for c in PK KEK db; do
     [ -f "${KEYS_DIR}/${c}.cer" ] || die "Secure Boot cert ${c}.cer not found in ${KEYS_DIR}"
 done
+# dbx: the exact EFI_SIGNATURE_LIST mkvarstore.py enrolls into efi-vars.{ovmf,aws}, delivered to
+# GCP as a KEK-signed authenticated variable update (dbx.auth.bin) -- the format GCP's BIN dbx
+# takes (cf. uefi.org DBXUpdate.bin); a bare ESL is accepted at image create but kills every VM
+# at start. Unset, GCP substitutes its own default (Microsoft) dbx.
+DBX_FILE="${WORK_DIR}/dbx.auth.bin"
+if [ "${DEFAULT_DBX}" != "true" ]; then
+    [ -f "${DBX_FILE}" ] || die "dbx.auth.bin not found: ${DBX_FILE} (rebuild: make build-${ARCH})"
+fi
 
 # os-release provides ID, VERSION_ID, BUILD_ID, NAME, PRETTY_NAME (our own artifact).
 # shellcheck disable=SC1090
@@ -158,18 +170,21 @@ ARCH_DASH=$(echo "${ARCH}" | tr '_' '-')
 # re-running after a rebuild -- new keys/binary, same VERSION_ID -- makes a new image instead of
 # silently reusing a stale one.
 IMAGE_NAME="${ID}-${ARCH_DASH}-${VERSION_DASH}-${BUILD_ID}"
+[ "${DEFAULT_DBX}" = "true" ] && IMAGE_NAME="${IMAGE_NAME}-defdbx"
 IMAGE_DESC="${PRETTY_NAME} version: ${VERSION_ID} build: ${BUILD_ID} arch: ${ARCH}"
 IMAGE_FAMILY="${ID}"
 
 if [ "${ARCH}" = "x86_64" ]; then
-    GUEST_OS_FEATURES="UEFI_COMPATIBLE,SEV_CAPABLE,SEV_SNP_CAPABLE,GVNIC"
+    GUEST_OS_FEATURES="UEFI_COMPATIBLE,SEV_CAPABLE,SEV_SNP_CAPABLE,TDX_CAPABLE,GVNIC"
 else
     GUEST_OS_FEATURES="UEFI_COMPATIBLE,GVNIC"
 fi
 
 echo "=== Checking for existing image ==="
-EXISTING_IMAGE=$(${GCLOUD} compute images list --project="${PROJECT}" \
-    --filter="name=${IMAGE_NAME}" --format="value(name)" 2>/dev/null || echo "")
+# Exact-name lookup: `images list --filter=name=X` is a pattern match, so X would also match
+# X-defdbx (or any longer name) and silently reuse the wrong image.
+EXISTING_IMAGE=$(${GCLOUD} compute images describe "${IMAGE_NAME}" --project="${PROJECT}" \
+    --format="value(name)" 2>/dev/null || echo "")
 
 if [ -n "${EXISTING_IMAGE}" ]; then
     echo "Image already exists: ${EXISTING_IMAGE}"
@@ -206,6 +221,14 @@ else
         record "gcp gcsobject ${PROJECT} ${GCS_URI}"
     fi
 
+    DBX_ARGS=()
+    if [ "${DEFAULT_DBX}" = "true" ]; then
+        echo "WARNING: --default-dbx: GCP's default (Microsoft) dbx, not ours -- test image only"
+    else
+        # gcloud types a key file by NAME: `*.bin` -> BIN, anything else must be DER X.509
+        # (googlecloudsdk/api_lib/compute/image_utils.py GetFileContentAndFileType).
+        DBX_ARGS=(--forbidden-database-file="${DBX_FILE}")
+    fi
     echo "=== Creating image ${IMAGE_NAME} (${GCP_ARCH}, ${GUEST_OS_FEATURES}) ==="
     ${GCLOUD} compute images create "${IMAGE_NAME}" --project="${PROJECT}" \
         --source-uri="${GCS_URI}" --guest-os-features="${GUEST_OS_FEATURES}" \
@@ -213,6 +236,7 @@ else
         --platform-key-file="${KEYS_DIR}/PK.cer" \
         --key-exchange-key-file="${KEYS_DIR}/KEK.cer" \
         --signature-database-file="${KEYS_DIR}/db.cer" \
+        "${DBX_ARGS[@]}" \
         || die "image create failed"
     IMAGE_FINAL="${IMAGE_NAME}"
     record "gcp image ${PROJECT} ${IMAGE_FINAL}"   # only when created by this run

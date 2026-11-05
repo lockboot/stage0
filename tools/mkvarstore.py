@@ -17,7 +17,9 @@ import argparse
 import base64
 import os
 import struct
+import subprocess
 import sys
+import tempfile
 import uuid
 
 # --- Well-known GUIDs (constants from the UEFI spec / edk2) ------------------
@@ -81,6 +83,35 @@ def sig_list_sha256(digest, owner):
     list_size = 16 + 4 + 4 + 4 + sig_size
     return (EFI_CERT_SHA256_GUID.bytes_le
             + struct.pack("<III", list_size, 0, sig_size) + sig)
+
+
+# --- dbx as an authenticated variable update (GCP) ---------------------------
+EFI_CERT_TYPE_PKCS7_GUID = uuid.UUID("4aafd29d-68df-49ee-8aa9-347d375665a7")
+
+
+def dbx_auth2(esl, timestamp, kek_cert, kek_key):
+    """`EFI_VARIABLE_AUTHENTICATION_2 || esl` for the dbx variable, signed by the KEK.
+
+    GCP's `--forbidden-database-file` takes this (fileType BIN, as uefi.org's
+    DBXUpdate.bin) -- a bare EFI_SIGNATURE_LIST is accepted at image create but kills
+    every VM at start. Signed content per the UEFI spec: VariableName (UCS-2, no NUL)
+    || VendorGuid || Attributes || TimeStamp || Data. `openssl cms -noattr` (no
+    signing-time attribute; RSA PKCS#1 v1.5 is deterministic) keeps the output a pure
+    function of (esl, timestamp, KEK), i.e. reproducible for a given key set.
+    """
+    signed = ("dbx".encode("utf-16-le") + IMAGE_SECURITY_DATABASE.bytes_le
+              + struct.pack("<I", ATTR_AUTH) + timestamp + esl)
+    with tempfile.TemporaryDirectory() as d:
+        src, p7 = os.path.join(d, "content"), os.path.join(d, "p7.der")
+        open(src, "wb").write(signed)
+        subprocess.run(["openssl", "cms", "-sign", "-binary", "-noattr", "-md", "sha256",
+                        "-outform", "DER", "-signer", kek_cert, "-inkey", kek_key,
+                        "-in", src, "-out", p7], check=True)
+        cert = open(p7, "rb").read()
+    # WIN_CERTIFICATE_UEFI_GUID: dwLength, wRevision 0x0200, WIN_CERT_TYPE_EFI_GUID 0x0EF1.
+    wincert = (struct.pack("<IHH", 4 + 2 + 2 + 16 + len(cert), 0x0200, 0x0EF1)
+               + EFI_CERT_TYPE_PKCS7_GUID.bytes_le + cert)
+    return timestamp + wincert + esl
 
 
 # --- one enrolled variable (metadata + raw data) ----------------------------
@@ -282,6 +313,13 @@ def main():
     ap.add_argument("--dict", required=True, help="AMZNUEFI v0 preset dictionary")
     ap.add_argument("--out-ovmf", required=True)
     ap.add_argument("--out-aws", required=True)
+    ap.add_argument("--out-dbx",
+                    help="also write the dbx EFI_SIGNATURE_LIST (the exact bytes enrolled "
+                         "above)")
+    ap.add_argument("--out-dbx-auth",
+                    help="also write that dbx as a KEK-signed authenticated variable update "
+                         "(GCP --forbidden-database-file; needs --kek-key)")
+    ap.add_argument("--kek-key", help="KEK private key (PEM), for --out-dbx-auth")
     args = ap.parse_args()
 
     epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
@@ -299,6 +337,14 @@ def main():
                          p["tail"]())
     open(args.out_ovmf, "wb").write(img)
     open(args.out_aws, "wb").write(serialize_aws(varlist, args.dict))
+    dbx = next(v for v in varlist if v.name == "dbx")
+    if args.out_dbx:
+        open(args.out_dbx, "wb").write(dbx.data)
+    if args.out_dbx_auth:
+        if not args.kek_key:
+            ap.error("--out-dbx-auth needs --kek-key")
+        open(args.out_dbx_auth, "wb").write(
+            dbx_auth2(dbx.data, dbx.timestamp, args.kek, args.kek_key))
 
 
 if __name__ == "__main__":
