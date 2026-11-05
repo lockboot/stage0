@@ -15,6 +15,9 @@
 	build/%/stage0.efi build/%/payload.efi build/%/boot.disk
 
 STAGE0_DIR = crates/stage0
+# STAGE0_FEATURES=verbose: debug build of stage0 (DNS/TCP/HTTP step logging). Changes the
+# measured binary -- debug only, never a release.
+STAGE0_FEATURES ?=
 
 # Default to the host architecture (uname -m gives x86_64 / aarch64 on Linux), so
 # bare `make`, `make boot`, `make test` "just work". Override with ARCH=... or by
@@ -35,8 +38,22 @@ docker-build-harness:
 # ---- Secure Boot keys: stage0's own snakeoil PK/KEK/db (regenerated per build) ----
 # The pattern rule generates the whole set into build/keys via tools/gen-keys.sh;
 # release.pem (below) is matched by its explicit rule instead.
+#
+# HAZMAT_WARNING_NO_REGEN_KEYS_DEV_ONLY=1 -- DEV ITERATION ONLY: reuse the existing build/keys
+# instead of re-minting them, so a rebuilt boot.disk still matches a cloud image/varstore already
+# enrolled with these keys (fast driver/debug loops: swap the disk, keep the keys). Never for a
+# release or any published image: the keys then outlive a single build. Refused under CI.
+ifeq ($(HAZMAT_WARNING_NO_REGEN_KEYS_DEV_ONLY),1)
+ifneq ($(CI),)
+$(error HAZMAT_WARNING_NO_REGEN_KEYS_DEV_ONLY is refused under CI)
+endif
+$(warning !!! HAZMAT_WARNING_NO_REGEN_KEYS_DEV_ONLY=1: REUSING existing Secure Boot keys in build/keys -- DEV ONLY, never release/publish this build !!!)
+build/keys/%:
+	@test -f $@ || { echo "HAZMAT_WARNING_NO_REGEN_KEYS_DEV_ONLY: $@ missing -- build once without it to mint keys" >&2; exit 1; }
+else
 build/keys/%: docker-build-base
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) ./tools/gen-keys.sh build/keys
+endif
 
 # ---- stage0-sign: this repo's standalone host-side signer (ed25519 keygen + domain-separated
 # signatures), so stage0 builds + tests without stage1's deploy tool. Built + run in the container.
@@ -108,7 +125,7 @@ build/%/gvnic.efi: docker-build-base
 # driver prerequisites must be built first; nothing extra to pass on the command line.
 build/%/stage0.efi: build/%/ena.efi build/%/gvnic.efi docker-build-base
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
-		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path $(STAGE0_DIR)/Cargo.toml --target $*-unknown-uefi && cp -v $(STAGE0_DIR)/target/$*-unknown-uefi/release/stage0.efi $@"
+		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path $(STAGE0_DIR)/Cargo.toml --target $*-unknown-uefi $(if $(STAGE0_FEATURES),--features $(STAGE0_FEATURES)) && cp -v $(STAGE0_DIR)/target/$*-unknown-uefi/release/stage0.efi $@"
 
 # ---- Assemble + db-sign the boot disk (privileged: losetup/mount) ----
 build/%/boot.disk: build/%/stage0.efi build/keys/db.crt

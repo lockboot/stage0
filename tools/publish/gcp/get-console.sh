@@ -56,21 +56,39 @@ case "${MODE}" in
 
         # --start is a BYTE index; resume from the `next` offset each response reports (it also
         # stays correct if the serial buffer rolled over and older bytes were dropped).
+        # Every gcloud call is a full Python start-up (~1s of CPU), so poll every 10s, and only
+        # when a poll brings nothing new ask for the instance status: once it is no longer
+        # RUNNING (stage0 powered off / stopped / deleted) do one last read and exit, instead of
+        # polling a dead instance forever.
         command -v jq >/dev/null 2>&1 || { echo "Error: --follow needs jq"; exit 1; }
         NEXT=0
-        while true; do
-            RESP=$(${GCLOUD} compute instances get-serial-port-output "${INSTANCE_NAME}" \
+        read_once() {
+            local resp n got=1
+            resp=$(${GCLOUD} compute instances get-serial-port-output "${INSTANCE_NAME}" \
                 --zone="${ZONE}" \
                 --project="${PROJECT}" \
                 --start="${NEXT}" --format=json 2>/dev/null || echo "")
-
-            if [ -n "${RESP}" ]; then
-                jq -j '.contents // ""' <<<"${RESP}"
-                N=$(jq -r '.next // empty' <<<"${RESP}")
-                [ -n "${N}" ] && NEXT="${N}"
+            if [ -n "${resp}" ]; then
+                jq -j '.contents // ""' <<<"${resp}"
+                n=$(jq -r '.next // empty' <<<"${resp}")
+                if [ -n "${n}" ] && [ "${n}" != "${NEXT}" ]; then NEXT="${n}"; got=0; fi
             fi
-
-            sleep 2
+            return "${got}"
+        }
+        while true; do
+            if ! read_once; then
+                STATUS=$(${GCLOUD} compute instances describe "${INSTANCE_NAME}" \
+                    --zone="${ZONE}" --project="${PROJECT}" \
+                    --format="value(status)" 2>/dev/null || echo "GONE")
+                if [ "${STATUS:-GONE}" != "RUNNING" ] && [ "${STATUS}" != "PROVISIONING" ] \
+                    && [ "${STATUS}" != "STAGING" ]; then
+                    read_once || true
+                    echo
+                    echo "--- ${INSTANCE_NAME} is ${STATUS:-GONE}; stopped following ---"
+                    exit 0
+                fi
+            fi
+            sleep 10
         done
         ;;
 
