@@ -43,6 +43,11 @@ Options:
                        including a post-mortem drain (EC2's serial buffer lags minutes)
   --stop               STOP (don't terminate) on shutdown, so the instance and its
                        serial console survive for debugging. Default is to terminate.
+  --tail-timeout <s>   with --tail: stop streaming after <s> seconds even if the
+                       instance is still running (default 0 = until it powers off).
+                       The instance is left running; terminate it (or cleanup.sh).
+  --manifest <f>       append the launched instance ("aws instance <region> <id>") to
+                       <f> for cleanup.sh
   -h, --help           show this help and exit
 
 Examples:
@@ -57,6 +62,8 @@ INSTANCE_TYPE=""
 SPOT=false
 TAIL=false
 STOP=false
+TAIL_TIMEOUT=0
+MANIFEST=""
 POSITIONAL=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -69,6 +76,10 @@ while [ $# -gt 0 ]; do
         --spot)            SPOT=true; shift ;;
         --tail)            TAIL=true; shift ;;
         --stop)            STOP=true; shift ;;
+        --tail-timeout)    TAIL_TIMEOUT="${2:?--tail-timeout needs a value}"; shift 2 ;;
+        --tail-timeout=*)  TAIL_TIMEOUT="${1#*=}"; shift ;;
+        --manifest)        MANIFEST="${2:?--manifest needs a value}"; shift 2 ;;
+        --manifest=*)      MANIFEST="${1#*=}"; shift ;;
         -h|--help)         usage; exit 0 ;;
         --) shift; while [ $# -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
         -*) echo "Error: unknown option: $1" >&2; usage; exit 1 ;;
@@ -119,7 +130,9 @@ RUN_ARGS=(
     --instance-type "${INSTANCE_TYPE}"
     --user-data "file://${CONFIG_FILE}"
     --instance-initiated-shutdown-behavior "${SHUTDOWN_BEHAVIOR}"
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME}}]"
+    # Project=lockboot: the deploy role (workspace tools/deploy/aws-iam.sh) only lets you
+    # start/stop/reboot instances carrying it.
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME}},{Key=Project,Value=lockboot}]"
 )
 if [ "${SPOT}" = "true" ]; then
     RUN_ARGS+=(--instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time"}}')
@@ -130,6 +143,7 @@ echo "=== Launching ${AMI_ID} (${ARCH}) as ${INSTANCE_TYPE} in ${REGION}${MARKET
 INSTANCE_ID=$(aws ec2 run-instances "${RUN_ARGS[@]}" \
     --query 'Instances[0].InstanceId' --output text) || die "run-instances failed"
 echo "Launched instance ${INSTANCE_ID} (Name=${NAME}, shutdown=${SHUTDOWN_BEHAVIOR})"
+if [ -n "${MANIFEST}" ]; then printf '%s\n' "aws instance ${REGION} ${INSTANCE_ID}" >> "${MANIFEST}"; fi
 
 if [ "${TAIL}" = "true" ]; then
     # Do NOT use `aws ec2 wait instance-running`: stage0 can boot, run, and power off
@@ -161,6 +175,7 @@ if [ "${TAIL}" = "true" ]; then
         echo "Watching ${INSTANCE_ID} state only (no console access; Ctrl-C to stop)..."
     fi
     PREV=""
+    TAIL_START=${SECONDS}
     DRAIN=0          # extra console fetches after the instance is gone (buffer lags)
     DRAIN_MAX=12     # ~2 min of post-mortem draining at 10s/poll
     while :; do
@@ -201,6 +216,10 @@ if [ "${TAIL}" = "true" ]; then
                 sleep 10
                 continue ;;
         esac
+        if [ "${TAIL_TIMEOUT}" -gt 0 ] && [ $((SECONDS - TAIL_START)) -ge "${TAIL_TIMEOUT}" ]; then
+            echo "--- --tail-timeout ${TAIL_TIMEOUT}s reached; instance ${INSTANCE_ID} still ${STATE} (left running) ---"
+            break
+        fi
         sleep 10
     done
 fi

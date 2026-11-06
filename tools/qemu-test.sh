@@ -20,13 +20,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP=/tmp
 
-# EC2 metadata mock (downloaded + sha256-verified on first run; cached next to the
-# script, override the cache dir with EC2_MOCK_CACHE).
+# Host arch (where QEMU runs), as opposed to ARCH (the guest). Both amd64 and arm64 hosts are
+# supported for both guests: KVM when they match, TCG emulation otherwise.
+HOST_ARCH="$(uname -m)"
+case "${HOST_ARCH}" in
+    x86_64)  AEMM_ARCH=amd64; AEMM_SHA256="4f89ddc71ac53ce540bda1f9c340526d558eed8e41349761f2798acf1b254950" ;;
+    aarch64) AEMM_ARCH=arm64; AEMM_SHA256="9dae5b5849365dbaa133309da81f49bafe94ec0aa7e6b05ce3eb7a8f151c2217" ;;
+    *) echo "Error: unsupported host arch ${HOST_ARCH} (need x86_64 or aarch64)" >&2; exit 1 ;;
+esac
+
+# EC2 metadata mock for the host arch (downloaded + sha256-verified on first run; cached next to
+# the script, override the cache dir with EC2_MOCK_CACHE).
 AEMM_VERSION="v1.13.0"
-AEMM_URL="https://github.com/aws/amazon-ec2-metadata-mock/releases/download/${AEMM_VERSION}/ec2-metadata-mock-linux-amd64"
-AEMM_SHA256="4f89ddc71ac53ce540bda1f9c340526d558eed8e41349761f2798acf1b254950"
+AEMM_URL="https://github.com/aws/amazon-ec2-metadata-mock/releases/download/${AEMM_VERSION}/ec2-metadata-mock-linux-${AEMM_ARCH}"
 EC2_MOCK_CACHE="${EC2_MOCK_CACHE:-${SCRIPT_DIR}}"
-AMMM="${EC2_MOCK_CACHE}/ec2-metadata-mock-linux-amd64"
+AMMM="${EC2_MOCK_CACHE}/ec2-metadata-mock-linux-${AEMM_ARCH}"
 
 usage() {
     cat <<'EOF'
@@ -50,6 +58,10 @@ Options:
                            (a sibling <payload>.sig is served too if present).
   --serve-dir <path>       Serve this whole directory at http://10.0.2.1:8000/
                            instead of a single payload (e.g. UKI + stage2).
+  --forward <port>         Forward a host TCP port to the guest (10.0.2.10).
+                           Repeatable (e.g. --forward 8402 --forward 9090).
+  --timeout <seconds>      Kill QEMU if the guest has not powered off by then, and
+                           exit 124 (default: 0 = no limit). For unattended runs.
   --trace                  Capture guest TCP on tap0 to a pcap (see --trace-file).
   --trace-file <path>      pcap output path (default: ./stage0-trace.pcap).
   -h, --help               Show this help.
@@ -69,6 +81,8 @@ PAYLOAD=""
 SERVE_DIR=""
 TRACE=0
 TRACE_FILE=""
+FORWARD_PORTS=()
+TIMEOUT=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -81,6 +95,8 @@ while [ $# -gt 0 ]; do
         --serve-dir)  SERVE_DIR="$2"; shift 2 ;;
         --trace)      TRACE=1; shift ;;
         --trace-file) TRACE_FILE="$2"; shift 2 ;;
+        --forward)    FORWARD_PORTS+=("$2"); shift 2 ;;
+        --timeout)    TIMEOUT="$2"; shift 2 ;;
         -h|--help)    usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
@@ -144,7 +160,9 @@ provision_tpm() {
     tpm2_startup -c
 
     local NV_ECC_CERT=0x01c10002 NV_ECC_TEMPLATE=0x01c10003
-    if tpm2_nvreadpublic ${NV_ECC_TEMPLATE} >/dev/null 2>&1; then
+    # Probe via the NV handle list: tpm2-tools 5.4's tpm2_nvreadpublic SEGFAULTs on an undefined
+    # index (exit 139), which dumped a root-owned `core` into the caller's cwd on every fresh boot.
+    if tpm2_getcap handles-nv-index | grep -qix -- "- $(printf '0x%X' $((NV_ECC_TEMPLATE)))"; then
         echo "vTPM already provisioned, skipping."
         tpm2_shutdown; swtpm_ioctl --unix "${sock}.ctrl" -s; rm -rf "${work}"; return
     fi
@@ -182,7 +200,8 @@ if [ "${ARCH}" = "x86_64" ]; then
     QEMU_CMD="qemu-system-x86_64"
     QEMU_MACHINE="-machine q35,smm=on"
     QEMU_CPU=""
-    QEMU_EXTRA="-enable-kvm"
+    # KVM on a matching host (unchanged: fails loudly without /dev/kvm); TCG on an arm64 host.
+    [ "${HOST_ARCH}" = "x86_64" ] && QEMU_EXTRA="-enable-kvm" || QEMU_EXTRA=""
     QEMU_SERIAL="-serial none"
     QEMU_SERIAL_DEVICE="-device isa-serial,chardev=char0"
     TPM_DEVICE="tpm-tis"
@@ -190,10 +209,21 @@ if [ "${ARCH}" = "x86_64" ]; then
 else
     OVMF_CODE="/usr/share/AAVMF/AAVMF_CODE.fd"
     QEMU_CMD="qemu-system-aarch64"
-    QEMU_MACHINE="-machine virt"
-    QEMU_CPU="-cpu cortex-a72"
-    QEMU_EXTRA=""
-    QEMU_SERIAL="-serial none"
+    if [ "${HOST_ARCH}" = "aarch64" ]; then
+        # KVM on a matching host: the guest takes the host's CPU + GIC.
+        QEMU_MACHINE="-machine virt,gic-version=host"
+        QEMU_CPU="-cpu host"
+        QEMU_EXTRA="-enable-kvm"
+    else
+        QEMU_MACHINE="-machine virt"
+        QEMU_CPU="-cpu cortex-a72"
+        QEMU_EXTRA=""
+    fi
+    # The virt board's PL011 carries AAVMF's UEFI ConOut (stage0's output). Attach it to the same
+    # muxed stdio as the pci-serial (ttyS0, where /dev/console lands) so the whole chain -- UEFI,
+    # kernel, init, userspace -- is captured, as it is on x86 via isa-serial. Kernel printk then
+    # appears on both (console=ttyAMA0 console=ttyS0), i.e. twice in this log.
+    QEMU_SERIAL="-serial chardev:char0"
     QEMU_SERIAL_DEVICE="-device pci-serial,id=serial0,chardev=char0"
     TPM_DEVICE="tpm-tis-device"
     PFLASH_SECURE=""
@@ -230,10 +260,13 @@ trap cleanup EXIT INT TERM
 
 echo "Press Ctrl-A, then X to exit QEMU"
 
-# --- Guest network: tap0 (10.0.2.1 gw + 169.254.169.254 IMDS), NAT out ------
+# --- Guest network: tap0 (gateway + 169.254.169.254 IMDS), NAT out -----------
+GUEST_GW=10.0.2.1
+GUEST_IP=10.0.2.10
+
 ip tuntap add dev tap0 mode tap
 ip link set tap0 up
-ip addr add 10.0.2.1/24 dev tap0
+ip addr add ${GUEST_GW}/24 dev tap0
 ip addr add 169.254.169.254/24 dev tap0
 
 if [ "${TRACE}" = 1 ]; then
@@ -265,35 +298,46 @@ fi
 if [ -n "${SERVE_ROOT}" ]; then
     # HTTP/1.1 (Content-Length + keep-alive). The stdlib default is HTTP/1.0
     # Connection: close, which OVMF's HttpDxe never completes the response token for.
-    ( cd "${SERVE_ROOT}" && exec python3 -c 'import http.server; http.server.SimpleHTTPRequestHandler.protocol_version="HTTP/1.1"; http.server.ThreadingHTTPServer(("10.0.2.1",8000), http.server.SimpleHTTPRequestHandler).serve_forever()' ) &
+    ( cd "${SERVE_ROOT}" && exec python3 -c "import http.server; http.server.SimpleHTTPRequestHandler.protocol_version='HTTP/1.1'; http.server.ThreadingHTTPServer(('${GUEST_GW}',8000), http.server.SimpleHTTPRequestHandler).serve_forever()" ) &
     echo $! > "${TMP}/payload-http.pid"
-    echo "Serving ${SERVE_ROOT} (HTTP/1.1) at http://10.0.2.1:8000/ :"
+    echo "Serving ${SERVE_ROOT} (HTTP/1.1) at http://${GUEST_GW}:8000/ :"
     ls -l "${SERVE_ROOT}" | sed 's/^/  /'
 fi
 
 echo 1 > /proc/sys/net/ipv4/ip_forward
 iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 
+for fwd_port in "${FORWARD_PORTS[@]}"; do
+    iptables -t nat -A PREROUTING -i eth0 -p tcp --dport "${fwd_port}" -j DNAT --to-destination ${GUEST_IP}:"${fwd_port}"
+    iptables -A FORWARD -i eth0 -p tcp -d ${GUEST_IP} --dport "${fwd_port}" -j ACCEPT
+    echo "Forwarding port ${fwd_port} -> ${GUEST_IP}:${fwd_port}"
+done
+
 # dnsmasq: EC2-style DHCP/DNS (gateway, DNS, classless route to IMDS, hostnames),
 # plus payload.lockboot.test -> 10.0.2.1 so hostname URLs exercise EFI_DNS4.
 {
-    for i in $(seq 10 20); do echo "10.0.2.${i} ip-10-0-2-${i}"; done
-    echo "10.0.2.1 payload.lockboot.test"
+    echo "${GUEST_IP} ip-${GUEST_IP//./-}"
+    echo "${GUEST_GW} payload.lockboot.test"
 } > "${TMP}/dnsmasq-hosts"
 dnsmasq --interface=tap0 --bind-interfaces \
-    --dhcp-range=10.0.2.10,10.0.2.20,12h \
-    --dhcp-option=3,10.0.2.1 \
-    --dhcp-option=6,10.0.2.1,8.8.8.8 \
+    --dhcp-range=${GUEST_IP},${GUEST_IP},12h \
+    --dhcp-option=3,${GUEST_GW} \
+    --dhcp-option=6,${GUEST_GW},8.8.8.8 \
     --dhcp-option=15,ec2.internal \
-    --dhcp-option=option:classless-static-route,169.254.169.254/32,10.0.2.1 \
+    --dhcp-option=option:classless-static-route,169.254.169.254/32,${GUEST_GW} \
     --dhcp-option=119,ec2.internal,local.compute.internal \
     --domain=ec2.internal \
     --expand-hosts \
     --addn-hosts="${TMP}/dnsmasq-hosts" \
     --log-queries
 
+# --timeout: bound an unattended run. A guest that never powers off is a failure, not a hang.
+QEMU_WRAP=()
+[ "${TIMEOUT}" != 0 ] && QEMU_WRAP=(timeout --foreground --kill-after=10 "${TIMEOUT}")
+QEMU_RC=0
+
 # shellcheck disable=SC2086
-${QEMU_CMD} \
+"${QEMU_WRAP[@]}" ${QEMU_CMD} \
     ${QEMU_CPU} \
     ${QEMU_EXTRA} \
     ${QEMU_MACHINE} \
@@ -313,4 +357,9 @@ ${QEMU_CMD} \
     -chardev stdio,mux=on,id=char0 \
     ${QEMU_SERIAL_DEVICE} \
     -drive "if=pflash,format=raw,unit=0,file=${OVMF_CODE},readonly=on" \
-    -drive "if=pflash,format=raw,unit=1,file=${OVMF_VARS}" || true
+    -drive "if=pflash,format=raw,unit=1,file=${OVMF_VARS}" || QEMU_RC=$?
+
+if [ "${TIMEOUT}" != 0 ] && { [ "${QEMU_RC}" = 124 ] || [ "${QEMU_RC}" = 137 ]; }; then
+    echo "qemu-test: TIMEOUT: guest did not power off within ${TIMEOUT}s" >&2
+    exit 124
+fi

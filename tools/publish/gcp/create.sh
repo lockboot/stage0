@@ -23,13 +23,15 @@ Build (or download) a stage0 boot disk and create a GCP image from it.
 
 Arguments:
   arch       x86_64 | aarch64
-  version    a stage0-v* release tag, or 'local' (default) for a local build
+  version    a v* release tag, or 'local' (default) for a local build
 
 Options:
   --project <p>  GCP project (default: active gcloud project)
   --region <r>   GCS bucket / zone region (default: ${DEFAULT_REGION})
   --public       make the image usable by any authenticated GCP user (default)
   --private      keep the image private to this project
+  --default-dbx  TEST ONLY: omit our dbx so GCP fills in its default (Microsoft) dbx; for
+                 dbx A/B measurement runs. Creates a separate '-defdbx' image.
   --no-verify    (release mode) skip gh attestation; fetch the public release asset
                  via curl so no gh install is needed
   --manifest <f>  append created resources to <f> for a teardown script, one per
@@ -38,7 +40,7 @@ Options:
 
 Examples:
   $(basename "$0") x86_64                          # active project, public image in ${DEFAULT_REGION}
-  $(basename "$0") --project my-proj x86_64 stage0-v0.1.0
+  $(basename "$0") --project my-proj x86_64 v0.1.0
   $(basename "$0") --private aarch64
 EOF
 }
@@ -49,6 +51,7 @@ PROJECT=""
 REGION="${DEFAULT_REGION}"
 PUBLIC=true
 NO_VERIFY=false
+DEFAULT_DBX=false
 MANIFEST=""
 POSITIONAL=()
 while [ $# -gt 0 ]; do
@@ -60,6 +63,7 @@ while [ $# -gt 0 ]; do
         --public)     PUBLIC=true; shift ;;
         --private)    PUBLIC=false; shift ;;
         --no-verify)  NO_VERIFY=true; shift ;;
+        --default-dbx) DEFAULT_DBX=true; shift ;;
         --manifest)   MANIFEST="${2:?--manifest needs a value}"; shift 2 ;;
         --manifest=*) MANIFEST="${1#*=}"; shift ;;
         -h|--help)    usage; exit 0 ;;
@@ -95,7 +99,7 @@ ${GCLOUD} auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null
 [ -n "${PROJECT}" ] || die "no project (pass --project or run: ${GCLOUD} config set project <id>)"
 
 CLEANUP=()
-cleanup() { local p; for p in "${CLEANUP[@]:-}"; do [ -n "$p" ] && rm -rf "$p"; done; }
+cleanup() { local p; for p in "${CLEANUP[@]:-}"; do [ -z "$p" ] || rm -rf "$p"; done; }
 trap cleanup EXIT
 
 # Save real stdout on fd 3 and route everything else to stderr, so the only thing
@@ -147,6 +151,14 @@ fi
 for c in PK KEK db; do
     [ -f "${KEYS_DIR}/${c}.cer" ] || die "Secure Boot cert ${c}.cer not found in ${KEYS_DIR}"
 done
+# dbx: the exact EFI_SIGNATURE_LIST mkvarstore.py enrolls into efi-vars.{ovmf,aws}, delivered to
+# GCP as a KEK-signed authenticated variable update (dbx.auth.bin) -- the format GCP's BIN dbx
+# takes (cf. uefi.org DBXUpdate.bin); a bare ESL is accepted at image create but kills every VM
+# at start. Unset, GCP substitutes its own default (Microsoft) dbx.
+DBX_FILE="${WORK_DIR}/dbx.auth.bin"
+if [ "${DEFAULT_DBX}" != "true" ]; then
+    [ -f "${DBX_FILE}" ] || die "dbx.auth.bin not found: ${DBX_FILE} (rebuild: make build-${ARCH})"
+fi
 
 # os-release provides ID, VERSION_ID, BUILD_ID, NAME, PRETTY_NAME (our own artifact).
 # shellcheck disable=SC1090
@@ -154,19 +166,25 @@ source "${OS_RELEASE_FILE}"
 
 VERSION_DASH=$(echo "${VERSION_ID}" | tr '.' '-')
 ARCH_DASH=$(echo "${ARCH}" | tr '_' '-')
-IMAGE_NAME="${ID}-${ARCH_DASH}-${VERSION_DASH}"           # GCP names: lowercase/digits/hyphens
+# GCP names: lowercase/digits/hyphens. BUILD_ID is part of the name (as for the EC2 AMI) so
+# re-running after a rebuild -- new keys/binary, same VERSION_ID -- makes a new image instead of
+# silently reusing a stale one.
+IMAGE_NAME="${ID}-${ARCH_DASH}-${VERSION_DASH}-${BUILD_ID}"
+[ "${DEFAULT_DBX}" = "true" ] && IMAGE_NAME="${IMAGE_NAME}-defdbx"
 IMAGE_DESC="${PRETTY_NAME} version: ${VERSION_ID} build: ${BUILD_ID} arch: ${ARCH}"
 IMAGE_FAMILY="${ID}"
 
 if [ "${ARCH}" = "x86_64" ]; then
-    GUEST_OS_FEATURES="UEFI_COMPATIBLE,SEV_CAPABLE,SEV_SNP_CAPABLE,GVNIC"
+    GUEST_OS_FEATURES="UEFI_COMPATIBLE,SEV_CAPABLE,SEV_SNP_CAPABLE,TDX_CAPABLE,GVNIC"
 else
     GUEST_OS_FEATURES="UEFI_COMPATIBLE,GVNIC"
 fi
 
 echo "=== Checking for existing image ==="
-EXISTING_IMAGE=$(${GCLOUD} compute images list --project="${PROJECT}" \
-    --filter="name=${IMAGE_NAME}" --format="value(name)" 2>/dev/null || echo "")
+# Exact-name lookup: `images list --filter=name=X` is a pattern match, so X would also match
+# X-defdbx (or any longer name) and silently reuse the wrong image.
+EXISTING_IMAGE=$(${GCLOUD} compute images describe "${IMAGE_NAME}" --project="${PROJECT}" \
+    --format="value(name)" 2>/dev/null || echo "")
 
 if [ -n "${EXISTING_IMAGE}" ]; then
     echo "Image already exists: ${EXISTING_IMAGE}"
@@ -198,9 +216,19 @@ else
         ${GCLOUD} storage cp "${TEMP_DIR}/${BUILD_ID}.tar.gz" "${GCS_URI}" --project="${PROJECT}" \
             --custom-metadata="version-id=${VERSION_ID},build-id=${BUILD_ID},name=${NAME},pretty-name=${PRETTY_NAME},id=${ID},arch=${ARCH}" \
             || die "GCS upload failed"
+        # Recorded only when THIS run created it: a reused object may belong to an earlier
+        # session and must not be swept by this run's teardown.
+        record "gcp gcsobject ${PROJECT} ${GCS_URI}"
     fi
-    record "gcp gcsobject ${PROJECT} ${GCS_URI}"
 
+    DBX_ARGS=()
+    if [ "${DEFAULT_DBX}" = "true" ]; then
+        echo "WARNING: --default-dbx: GCP's default (Microsoft) dbx, not ours -- test image only"
+    else
+        # gcloud types a key file by NAME: `*.bin` -> BIN, anything else must be DER X.509
+        # (googlecloudsdk/api_lib/compute/image_utils.py GetFileContentAndFileType).
+        DBX_ARGS=(--forbidden-database-file="${DBX_FILE}")
+    fi
     echo "=== Creating image ${IMAGE_NAME} (${GCP_ARCH}, ${GUEST_OS_FEATURES}) ==="
     ${GCLOUD} compute images create "${IMAGE_NAME}" --project="${PROJECT}" \
         --source-uri="${GCS_URI}" --guest-os-features="${GUEST_OS_FEATURES}" \
@@ -208,10 +236,11 @@ else
         --platform-key-file="${KEYS_DIR}/PK.cer" \
         --key-exchange-key-file="${KEYS_DIR}/KEK.cer" \
         --signature-database-file="${KEYS_DIR}/db.cer" \
+        "${DBX_ARGS[@]}" \
         || die "image create failed"
     IMAGE_FINAL="${IMAGE_NAME}"
+    record "gcp image ${PROJECT} ${IMAGE_FINAL}"   # only when created by this run
 fi
-record "gcp image ${PROJECT} ${IMAGE_FINAL}"
 
 # Make the image publicly launchable (default; --private opts out): any authenticated
 # GCP user can create instances from it (per-customer config lives in user-data).
@@ -235,7 +264,7 @@ echo ""
 
 DEFAULT_ZONE=$(${GCLOUD} config get-value compute/zone 2>/dev/null || echo "")
 [ -n "${DEFAULT_ZONE}" ] || DEFAULT_ZONE="${REGION}-a"
-if [ "${ARCH}" = "aarch64" ]; then MACHINE_TYPE="t2a-standard-1"; TECH="ARM TrustZone"; else MACHINE_TYPE="n2d-standard-2"; TECH="AMD SEV-SNP"; fi
+if [ "${ARCH}" = "aarch64" ]; then MACHINE_TYPE="t2a-standard-1"; TECH="Shielded VM, no confidential type"; else MACHINE_TYPE="n2d-standard-2"; TECH="AMD SEV-SNP"; fi
 
 echo "Launch a Confidential VM (${TECH}):"
 echo "  ${SCRIPT_DIR}/launch-instance.sh my-instance ${DEFAULT_ZONE} ${MACHINE_TYPE} ${IMAGE_FINAL} config.json"

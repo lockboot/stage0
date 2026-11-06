@@ -93,24 +93,21 @@ echo "Disk image created: ${DISK_IMAGE}"
 ls -lh "${DISK_IMAGE}"
 
 # --- Generate Secure Boot variables (OVMF + AWS) from stage0's own keys ---
-if [ "${ARCH}" = "x86_64" ]; then
-    OVMF_VARS_ORIG="/usr/share/OVMF/OVMF_VARS_4M.fd"
-else
-    OVMF_VARS_ORIG="/usr/share/AAVMF/AAVMF_VARS.snakeoil.fd"
-fi
+# tools/mkvarstore.py builds the whole enrolled varstore (edk2 pflash + AWS
+# AMZNUEFI) from scratch in pure-stdlib Python -- no virt-fw-vars, no distro
+# firmware template. Only stage0's PK/KEK/db are enrolled, and the output is
+# byte-reproducible (auth-variable timestamp fixed from SOURCE_DATE_EPOCH).
 EFI_VARS_OVMF="${OUTPUT_DIR}/efi-vars.ovmf"
 EFI_VARS_AWS="${OUTPUT_DIR}/efi-vars.aws"
-if [ -f "${OVMF_VARS_ORIG}" ]; then
-    virt-fw-vars --input "${OVMF_VARS_ORIG}" --output "${EFI_VARS_OVMF}" --output-aws "${EFI_VARS_AWS}" \
-      --add-db "$(cat "${KEYDIR}/db.guid")" "${KEYDIR}/db.crt" \
-      --add-kek "$(cat "${KEYDIR}/KEK.guid")" "${KEYDIR}/KEK.crt" \
-      --set-pk "$(cat "${KEYDIR}/PK.guid")" "${KEYDIR}/PK.crt" \
-      --set-true DeployedMode \
-      --secure-boot
-    echo "EFI vars written: ${EFI_VARS_OVMF}"
-else
-    echo "Warning: ${OVMF_VARS_ORIG} not found; skipping EFI vars generation."
-fi
+python3 "${REPO_ROOT}/tools/mkvarstore.py" --arch "${ARCH}" \
+  --pk  "${KEYDIR}/PK.crt"  --pk-guid  "${KEYDIR}/PK.guid" \
+  --kek "${KEYDIR}/KEK.crt" --kek-guid "${KEYDIR}/KEK.guid" \
+  --db  "${KEYDIR}/db.crt"  --db-guid  "${KEYDIR}/db.guid" \
+  --dict "${REPO_ROOT}/tools/firmware/amznuefi-v0.dict" \
+  --out-ovmf "${EFI_VARS_OVMF}" --out-aws "${EFI_VARS_AWS}" \
+  --out-dbx "${OUTPUT_DIR}/dbx.esl" \
+  --out-dbx-auth "${OUTPUT_DIR}/dbx.auth.bin" --kek-key "${KEYDIR}/KEK.crt.key"
+echo "EFI vars written: ${EFI_VARS_OVMF}"
 
 # Emit os-release so the cloud publishers can name/tag the image. BUILD_ID is
 # derived from the signed stage0 hash so each build is traceable.
@@ -130,6 +127,11 @@ YEAR_MONTH=$(date +%y.%m)
 for f in db.cer db.guid PK.cer PK.guid KEK.cer KEK.guid; do
     [ -f "${KEYDIR}/${f}" ] && cp "${KEYDIR}/${f}" "${OUTPUT_DIR}/"
 done
+
+# Predicted PCRs (3-7) at stage0's payload handoff, reproduced from the artifacts above alone
+# (BOOT*.EFI, boot.disk, *.cer, *.guid, dbx.esl): the reference a verifier checks a quote against.
+python3 "${REPO_ROOT}/tools/predict-pcrs.py" "${OUTPUT_DIR}" --out "${OUTPUT_DIR}/pcrs.json"
+echo "Predicted PCRs written: ${OUTPUT_DIR}/pcrs.json"
 
 if [ -n "${OWNER_UID:-}" ] && [ -n "${OWNER_GID:-}" ]; then
     chown -R "${OWNER_UID}:${OWNER_GID}" "${OUTPUT_DIR}"

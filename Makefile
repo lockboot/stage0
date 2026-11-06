@@ -15,6 +15,9 @@
 	build/%/stage0.efi build/%/payload.efi build/%/boot.disk
 
 STAGE0_DIR = crates/stage0
+# STAGE0_FEATURES=verbose: debug build of stage0 (DNS/TCP/HTTP step logging). Changes the
+# measured binary -- debug only, never a release.
+STAGE0_FEATURES ?=
 
 # Default to the host architecture (uname -m gives x86_64 / aarch64 on Linux), so
 # bare `make`, `make boot`, `make test` "just work". Override with ARCH=... or by
@@ -35,8 +38,22 @@ docker-build-harness:
 # ---- Secure Boot keys: stage0's own snakeoil PK/KEK/db (regenerated per build) ----
 # The pattern rule generates the whole set into build/keys via tools/gen-keys.sh;
 # release.pem (below) is matched by its explicit rule instead.
+#
+# HAZMAT_WARNING_NO_REGEN_KEYS_DEV_ONLY=1 -- DEV ITERATION ONLY: reuse the existing build/keys
+# instead of re-minting them, so a rebuilt boot.disk still matches a cloud image/varstore already
+# enrolled with these keys (fast driver/debug loops: swap the disk, keep the keys). Never for a
+# release or any published image: the keys then outlive a single build. Refused under CI.
+ifeq ($(HAZMAT_WARNING_NO_REGEN_KEYS_DEV_ONLY),1)
+ifneq ($(CI),)
+$(error HAZMAT_WARNING_NO_REGEN_KEYS_DEV_ONLY is refused under CI)
+endif
+$(warning !!! HAZMAT_WARNING_NO_REGEN_KEYS_DEV_ONLY=1: REUSING existing Secure Boot keys in build/keys -- DEV ONLY, never release/publish this build !!!)
+build/keys/%:
+	@test -f $@ || { echo "HAZMAT_WARNING_NO_REGEN_KEYS_DEV_ONLY: $@ missing -- build once without it to mint keys" >&2; exit 1; }
+else
 build/keys/%: docker-build-base
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) ./tools/gen-keys.sh build/keys
+endif
 
 # ---- stage0-sign: this repo's standalone host-side signer (ed25519 keygen + domain-separated
 # signatures), so stage0 builds + tests without stage1's deploy tool. Built + run in the container.
@@ -53,17 +70,17 @@ sign-test: docker-build-base
 
 # ---- CI gate: fmt + clippy + unit tests across all crates (what the branch ruleset requires) ----
 # stage0 is not one cargo workspace: 4 independent crates in two target families. The EFI crates
-# (ena, stage0, stage0-test-payload) are no_std UEFI and not host-testable -> fmt + clippy on the
+# (ena, gvnic, stage0, stage0-test-payload) are no_std UEFI and not host-testable -> fmt + clippy on the
 # UEFI target; the host signer (stage0-sign) also runs its unit tests (incl. the golden vector).
-UEFI_CRATES := ena stage0 stage0-test-payload
+UEFI_CRATES := ena gvnic stage0 stage0-test-payload
 HOST_CRATES := stage0-sign
 .PHONY: ci fmt-fix
 fmt-fix: docker-build-base ## Apply rustfmt across all crates (no --check)
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c '\
 		for c in $(UEFI_CRATES) $(HOST_CRATES); do cargo fmt --manifest-path crates/$$c/Cargo.toml; done'
-# ena.efi is include_bytes!'d by the stage0 crate, so it must exist before clippy/check can
+# ena.efi + gvnic.efi are include_bytes!'d by the stage0 crate, so they must exist before clippy/check can
 # compile it (a clean CI checkout has no build/ artifacts; a warm local tree hid this).
-ci: docker-build-base build/x86_64/ena.efi
+ci: docker-build-base build/x86_64/ena.efi build/x86_64/gvnic.efi
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c '\
 		set -e; rustup target add x86_64-unknown-uefi x86_64-unknown-linux-musl; \
 		for c in $(UEFI_CRATES) $(HOST_CRATES); do \
@@ -93,14 +110,22 @@ build/%/ena.efi: docker-build-base
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
 		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path crates/ena/Cargo.toml --target $*-unknown-uefi && cp -v crates/ena/target/$*-unknown-uefi/release/ena.efi $@"
 
+# ---- Build the gvnic.efi UEFI driver (embedded into stage0 for GCP/gVNIC netboot) ----
+# Same shape as ena.efi, for the Google Virtual NIC: GCP's UEFI firmware ships no gVNIC
+# driver, and GCP requires gVNIC for Confidential VMs and Arm. Embedded unconditionally.
+.PRECIOUS: build/%/gvnic.efi
+build/%/gvnic.efi: docker-build-base
+	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
+		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path crates/gvnic/Cargo.toml --target $*-unknown-uefi && cp -v crates/gvnic/target/$*-unknown-uefi/release/gvnic.efi $@"
+
 # ---- Build the stage0 UEFI binary ----
 # mkdir runs inside the container (as DOCKER_SAMEUSER) so the output dir is owned
 # by the build user, not by the host caller (which is root under `gh act`).
-# stage0 include_bytes! build/$*/ena.efi unconditionally (one measured unit), so the
-# ena.efi prerequisite must be built first; nothing extra to pass on the command line.
-build/%/stage0.efi: build/%/ena.efi docker-build-base
+# stage0 include_bytes! build/$*/{ena,gvnic}.efi unconditionally (one measured unit), so the
+# driver prerequisites must be built first; nothing extra to pass on the command line.
+build/%/stage0.efi: build/%/ena.efi build/%/gvnic.efi docker-build-base
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
-		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path $(STAGE0_DIR)/Cargo.toml --target $*-unknown-uefi && cp -v $(STAGE0_DIR)/target/$*-unknown-uefi/release/stage0.efi $@"
+		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path $(STAGE0_DIR)/Cargo.toml --target $*-unknown-uefi $(if $(STAGE0_FEATURES),--features $(STAGE0_FEATURES)) && cp -v $(STAGE0_DIR)/target/$*-unknown-uefi/release/stage0.efi $@"
 
 # ---- Assemble + db-sign the boot disk (privileged: losetup/mount) ----
 build/%/boot.disk: build/%/stage0.efi build/keys/db.crt
@@ -132,9 +157,10 @@ build/%/args.json.sig: build/keys/release.pem | sign-bin
 
 # ---- QEMU harness: the lean harness image bakes qemu-test.sh as its entrypoint
 # (and the EC2_MOCK_CACHE + iptables-ack env), so we just append CLI args. ----
+# HARNESS_TIMEOUT=<s> bounds each boot (qemu-test.sh --timeout); unset = no limit.
 STAGE0_QEMU = $(DOCKER_RUN) $(DOCKER_OPT_KVM) \
 	--cap-add=NET_ADMIN --device=/dev/net/tun \
-	$(HARNESS_IMAGE)
+	$(HARNESS_IMAGE) $(if $(HARNESS_TIMEOUT),--timeout $(HARNESS_TIMEOUT))
 
 # Boot stage0 under QEMU. Serves a staging dir (so payload, signed args, and a signed
 # manifest are all served uniformly at http://SERVE_HOST/<file>) and regenerates the
@@ -219,6 +245,17 @@ smoke-boot-%: build/%/boot.disk build/%/payload.efi build/%/args.json.sig docker
 	if [ "$$fail" = 0 ]; then echo "ALL STAGE0 BOOT TESTS PASSED"; else echo "SOME STAGE0 BOOT TESTS FAILED"; exit 1; fi
 
 smoke-boot: smoke-boot-$(ARCH)
+
+# ---- Self-test: stage0's part of the workspace `make selftest` (PASS/FAIL, non-zero on FAIL).
+# The boot-test matrix above, with every boot time-bounded so a hang fails instead of blocking.
+# One bound for both arches (~3x the slowest measured boot; aarch64 is TCG-emulated but fast).
+SELFTEST_TIMEOUT_x86_64  ?= 300
+SELFTEST_TIMEOUT_aarch64 ?= 300
+.PHONY: selftest
+selftest:
+	@echo "needs an arch suffix, e.g. 'make selftest-x86_64'." >&2; exit 2
+selftest-%:
+	$(MAKE) --no-print-directory smoke-boot-$* HARNESS_TIMEOUT=$(SELFTEST_TIMEOUT_$*)
 
 # Arch-less convenience forms target the host architecture ($(ARCH)).
 .PHONY: build boot test
