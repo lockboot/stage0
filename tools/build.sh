@@ -128,6 +128,11 @@ for f in db.cer db.guid PK.cer PK.guid KEK.cer KEK.guid; do
     [ -f "${KEYDIR}/${f}" ] && cp "${KEYDIR}/${f}" "${OUTPUT_DIR}/"
 done
 
+# Predicted PCRs (3-7) at stage0's payload handoff, reproduced from the artifacts above alone
+# (BOOT*.EFI, boot.disk, *.cer, *.guid, dbx.esl): the reference a verifier checks a quote against.
+python3 "${REPO_ROOT}/tools/predict-pcrs.py" "${OUTPUT_DIR}" --out "${OUTPUT_DIR}/pcrs.json"
+echo "Predicted PCRs written: ${OUTPUT_DIR}/pcrs.json"
+
 if [ -n "${OWNER_UID:-}" ] && [ -n "${OWNER_GID:-}" ]; then
     chown -R "${OWNER_UID}:${OWNER_GID}" "${OUTPUT_DIR}"
 fi

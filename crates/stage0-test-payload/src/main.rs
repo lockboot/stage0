@@ -63,6 +63,10 @@ fn main() -> Status {
         Ok(()) => {}
         Err(e) => println!("payload: could not read PCRs: {e}"),
     }
+    // Best effort: some firmware (EC2) does not hand out its log; the PCR dump above stands alone.
+    if let Err(e) = print_event_log() {
+        println!("payload: could not read TCG2 event log: {e}");
+    }
 
     // Experiment: attempt the User -> Deployed Mode transition from here (pre-ExitBootServices,
     // the same position stage0 would do it from), AFTER this boot's PCRs were dumped, so the next
@@ -206,5 +210,42 @@ fn print_pcrs() -> Result<()> {
         );
     }
     println!("payload: ===PCR-DUMP-END===");
+    Ok(())
+}
+
+/// Dump the firmware's TCG2 (crypto-agile) event log, so the PCR predictor's event sequence can
+/// be checked against what the firmware actually measured. Per event, bracketed by stable markers:
+///   payload: EV <n> <pcr> <type-hex>
+///   payload: EVD <n> <alg-id-hex> <digest-hex>      (one per bank)
+///   payload: EVX <n> <hex>                          (event data, <= 64 bytes per line, in order)
+fn print_event_log() -> Result<()> {
+    let handle = boot::get_handle_for_protocol::<Tcg>()
+        .map_err(|e| anyhow!("no EFI_TCG2_PROTOCOL: {:?}", e.status()))?;
+    let mut tcg = boot::open_protocol_exclusive::<Tcg>(handle)
+        .map_err(|e| anyhow!("open EFI_TCG2_PROTOCOL: {:?}", e.status()))?;
+    let log = tcg
+        .get_event_log_v2()
+        .map_err(|e| anyhow!("GetEventLog(TCG_2): {:?}", e.status()))?;
+
+    println!("payload: ===EVENTLOG-BEGIN===");
+    let mut n = 0usize;
+    for ev in log.iter() {
+        println!(
+            "payload: EV {n} {} {:08x}",
+            ev.pcr_index().0,
+            ev.event_type().0
+        );
+        for (alg, digest) in ev.digests() {
+            println!("payload: EVD {n} {:04x} {}", alg.0, hex::encode(digest));
+        }
+        for chunk in ev.event_data().chunks(64) {
+            println!("payload: EVX {n} {}", hex::encode(chunk));
+        }
+        n += 1;
+    }
+    println!(
+        "payload: ===EVENTLOG-END=== events={n} truncated={}",
+        log.is_truncated()
+    );
     Ok(())
 }
