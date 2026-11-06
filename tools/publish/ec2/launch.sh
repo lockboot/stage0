@@ -130,7 +130,9 @@ RUN_ARGS=(
     --instance-type "${INSTANCE_TYPE}"
     --user-data "file://${CONFIG_FILE}"
     --instance-initiated-shutdown-behavior "${SHUTDOWN_BEHAVIOR}"
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME}}]"
+    # Project=lockboot: the deploy role (workspace tools/deploy/aws-iam.sh) only lets you
+    # start/stop/reboot instances carrying it.
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME}},{Key=Project,Value=lockboot}]"
 )
 if [ "${SPOT}" = "true" ]; then
     RUN_ARGS+=(--instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time"}}')

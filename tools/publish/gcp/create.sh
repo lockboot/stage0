@@ -99,7 +99,7 @@ ${GCLOUD} auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null
 [ -n "${PROJECT}" ] || die "no project (pass --project or run: ${GCLOUD} config set project <id>)"
 
 CLEANUP=()
-cleanup() { local p; for p in "${CLEANUP[@]:-}"; do [ -n "$p" ] && rm -rf "$p"; done; }
+cleanup() { local p; for p in "${CLEANUP[@]:-}"; do [ -z "$p" ] || rm -rf "$p"; done; }
 trap cleanup EXIT
 
 # Save real stdout on fd 3 and route everything else to stderr, so the only thing

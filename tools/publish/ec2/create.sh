@@ -101,7 +101,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Single cleanup hook for every temp path we create.
 CLEANUP=()
-cleanup() { local p; for p in "${CLEANUP[@]:-}"; do [ -n "$p" ] && rm -rf "$p"; done; }
+cleanup() { local p; for p in "${CLEANUP[@]:-}"; do [ -z "$p" ] || rm -rf "$p"; done; }
 trap cleanup EXIT
 
 # Save real stdout on fd 3 and route everything else to stderr, so the only thing
