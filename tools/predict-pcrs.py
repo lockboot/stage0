@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# Reproduce stage0's PCR values from its release artifacts -- the root of the verification path.
+# stage0's PCR replay file -- the root of the verification path.
 #
-# Given a stage0 build/release directory, compute the PCRs the firmware will hold when stage0
-# hands off to its payload (before ExitBootServices), per bank, by replaying the exact event
-# sequence UEFI firmware logs (confirmed event-by-event against the OVMF event log and the GCE
-# logs in go-tpm-tools' test data; values match QEMU and GCP across sha1/sha256/sha384/sha512):
+# Given a stage0 build/release directory, write the events that UEFI firmware and stage0 extend
+# from TPM reset to stage0's payload handoff (before ExitBootServices), as a pcr-replay/v1 file
+# (format and verifier: workspace tools/pcr-replay). Each event carries a derivation from the
+# release artifacts AND the digests computed here, independently, so a replay cross-checks both.
+# Confirmed event-by-event against the OVMF event log and GCE event logs, sha1/256/384/512.
 #
 #   PCR3, PCR6  EV_SEPARATOR only (nothing else is measured there).
 #   PCR4        EV_EFI_ACTION "Calling EFI Application from Boot Option", EV_SEPARATOR,
@@ -12,50 +13,50 @@
 #               (The embedded NIC drivers and the payload are loaded through stage0's own
 #               Security2 override, which bypasses the firmware's image measurement: the
 #               drivers are covered by stage0's own hash, the payload by PCR14.)
-#   PCR5        EV_SEPARATOR, EV_EFI_GPT_EVENT = UEFI_GPT_DATA of boot.disk
-#               (header || NumberOfPartitions || the non-empty partition entries).
-#   PCR7        SecureBoot=1, PK, KEK, db, dbx (EV_EFI_VARIABLE_DRIVER_CONFIG, the enrolled ESLs),
-#               EV_SEPARATOR, then EV_EFI_VARIABLE_AUTHORITY = the db entry that verified stage0.
+#   PCR5        EV_SEPARATOR, EV_EFI_GPT_EVENT = UEFI_GPT_DATA of boot.disk.
+#   PCR7        SecureBoot, PK, KEK, db, dbx (EV_EFI_VARIABLE_DRIVER_CONFIG, the enrolled ESLs),
+#               EV_SEPARATOR, EV_EFI_VARIABLE_AUTHORITY = the db entry that verified stage0.
 #               The ESLs are rebuilt with mkvarstore.py's own code; on GCP they are
 #               byte-identical because the owner GUID is GCP's (see gen-keys.sh).
-#   PCR14       (with --payload-sha256) stage0's direct TPM2_PCR_Extend of the payload digest:
-#               not in the event log; event digest = H_bank(sha256(payload)).
+#   PCR14       stage0's direct TPM2_PCR_Extend of its payload: H_bank(sha256(payload)), not
+#               logged. An input (the payload is the deployment's choice).
+#   PCR8-13, 15-23  not extended.
 #
-# Not reproduced, by design: PCR0 (firmware code), PCR1 (firmware-created boot entries), PCR2
-# (option ROMs / platform drivers). They measure the provider's own firmware and configuration,
-# which sits inside the trust boundary the provider's vTPM already implies, and they change with
-# provider firmware updates -- record them as per-instance-type golden readings, never bind keys
-# to them.
+# Not modelled: PCR0-2 (provider firmware code, firmware boot entries, option ROMs). They are the
+# platform's, inside the trust boundary its vTPM already implies, and change with its firmware
+# updates: a per-platform replay file (golden readings) supplies them.
 #
-# Output (vaportpm JSON layout): {"pcrs": {"sha256": {"4": "<hex>", ...}, "sha384": {...}}}
+# Also writes pcrs.json (vaportpm layout): replaying this file alone, i.e. every PCR it models
+# except the payload-dependent PCR14 -- the reference a verifier compares a quote against.
 #
-# usage: predict-pcrs.py <build-dir> [--payload-sha256 HEX] [--banks sha256,sha384] [--out F]
-#        predict-pcrs.py <build-dir> --check <serial.log>   (compare against the test payload's
-#                                                             "payload: PCR <alg> <nn> <hex>" dump)
+# usage: predict-pcrs.py <build-dir> [--banks sha256,sha384] --replay F [--out pcrs.json]
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
 import os
-import re
 import struct
 import sys
 import uuid
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mkvarstore as mv  # noqa: E402
 
 BOOT_EFI = {"x86_64": "BOOTX64.EFI", "aarch64": "BOOTAA64.EFI"}
 SECTOR = 512
+SEPARATOR = b"\0\0\0\0"
+CALLING = "Calling EFI Application from Boot Option"
 
 
 # --- event payloads (the data each event's digest is computed over) -----------------------------
-def uefi_variable_data(vendor, name, data):
+def uefi_variable_data(vendor: uuid.UUID, name: str, data: bytes) -> bytes:
     """UEFI_VARIABLE_DATA: VariableName GUID, UnicodeNameLength, VariableDataLength, name, data."""
-    n = name.encode("utf-16-le")
-    return vendor.bytes_le + struct.pack("<QQ", len(name), len(data)) + n + data
+    return vendor.bytes_le + struct.pack("<QQ", len(name), len(data)) + name.encode("utf-16-le") + data
 
 
-def authenticode(pe, H):
+def authenticode(pe: bytes, H: Any) -> bytes:
     """Authenticode PE image hash (the digest firmware logs for a loaded image)."""
     pe_off = struct.unpack_from("<I", pe, 0x3C)[0]
     coff = pe_off + 4
@@ -87,7 +88,7 @@ def authenticode(pe, H):
     return h.digest()
 
 
-def gpt_data(disk_path):
+def gpt_data(disk_path: str) -> bytes:
     """UEFI_GPT_DATA: the primary GPT header, entry count, then the non-empty entries."""
     with open(disk_path, "rb") as f:
         f.seek(SECTOR)
@@ -103,98 +104,126 @@ def gpt_data(disk_path):
     return hdr[:hsize] + struct.pack("<Q", len(used)) + b"".join(used)
 
 
-# --- prediction ------------------------------------------------------------------------------------
-def read(d, name):
+# --- the replay file ------------------------------------------------------------------------------
+def read(d: str, name: str) -> bytes:
     with open(os.path.join(d, name), "rb") as f:
         return f.read()
 
 
-def owner(d, role):
+def owner(d: str, role: str) -> uuid.UUID:
     return uuid.UUID(read(d, f"{role}.guid").decode().strip())
 
 
-def detect_arch(d):
+def detect_arch(d: str) -> str:
     found = [a for a, f in BOOT_EFI.items() if os.path.exists(os.path.join(d, f))]
     if len(found) != 1:
         raise SystemExit(f"{d}: expected exactly one of {sorted(BOOT_EFI.values())}")
     return found[0]
 
 
-def predict(d, banks, payload_sha256=None):
+def replay_file(d: str, banks: list[str]) -> dict[str, Any]:
     arch = detect_arch(d)
-    efi = read(d, BOOT_EFI[arch])
+    efi_name = BOOT_EFI[arch]
+    files = {n: read(d, n) for n in (efi_name, "boot.disk", "PK.cer", "KEK.cer", "db.cer", "dbx.esl")}
     gpt = gpt_data(os.path.join(d, "boot.disk"))
-    pk, kek, db = read(d, "PK.cer"), read(d, "KEK.cer"), read(d, "db.cer")
-    db_owner = owner(d, "db")
-    pcr7_events = [
-        uefi_variable_data(mv.EFI_GLOBAL_VARIABLE, "SecureBoot", b"\x01"),
-        uefi_variable_data(mv.EFI_GLOBAL_VARIABLE, "PK", mv.sig_list_x509(pk, owner(d, "PK"))),
-        uefi_variable_data(mv.EFI_GLOBAL_VARIABLE, "KEK", mv.sig_list_x509(kek, owner(d, "KEK"))),
-        uefi_variable_data(mv.IMAGE_SECURITY_DATABASE, "db", mv.sig_list_x509(db, db_owner)),
-        uefi_variable_data(mv.IMAGE_SECURITY_DATABASE, "dbx", read(d, "dbx.esl")),
-        None,  # separator
-        # EV_EFI_VARIABLE_AUTHORITY: the EFI_SIGNATURE_DATA (owner || cert) that verified stage0
-        uefi_variable_data(mv.IMAGE_SECURITY_DATABASE, "db", db_owner.bytes_le + db),
+    own = {r: owner(d, r) for r in ("PK", "KEK", "db")}
+
+    def var(vendor: uuid.UUID, name: str, data_expr: dict[str, Any]) -> dict[str, Any]:
+        return {"uefi_variable": {"vendor": str(vendor), "name": name, "data": data_expr}}
+
+    def esl(role: str) -> dict[str, Any]:
+        return {"efi_signature_list": {"type": "x509", "owner": str(own[role]),
+                                       "data": {"artifact": f"{role}.cer"}}}
+
+    sep_expr = {"hex": SEPARATOR.hex()}
+    # (pcr, type, by, about, derivation, digest mode, bytes for the local computation)
+    G, S = mv.EFI_GLOBAL_VARIABLE, mv.IMAGE_SECURITY_DATABASE
+    ev: list[tuple[int, str, str, str, dict[str, Any], str, bytes]] = [
+        (3, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
+        (4, "EV_EFI_ACTION", "firmware", "boot option dispatch", {"utf8": CALLING}, "hash", CALLING.encode()),
+        (4, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
+        (4, "EV_EFI_BOOT_SERVICES_APPLICATION", "firmware", f"stage0 ({efi_name}, Authenticode)",
+         {"artifact": efi_name}, "authenticode", files[efi_name]),
+        (5, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
+        (5, "EV_EFI_GPT_EVENT", "firmware", "UEFI_GPT_DATA of boot.disk",
+         {"gpt": {"artifact": "boot.disk"}}, "hash", gpt),
+        (6, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
+        (7, "EV_EFI_VARIABLE_DRIVER_CONFIG", "firmware", "SecureBoot = 1",
+         var(G, "SecureBoot", {"hex": "01"}), "hash", uefi_variable_data(G, "SecureBoot", b"\x01")),
     ]
+    for role, vendor in (("PK", G), ("KEK", G), ("db", S)):
+        ev.append((7, "EV_EFI_VARIABLE_DRIVER_CONFIG", "firmware", f"{role}: one x509 ESL ({role}.cer)",
+                   var(vendor, role, esl(role)), "hash",
+                   uefi_variable_data(vendor, role, mv.sig_list_x509(files[f"{role}.cer"], own[role]))))
+    ev += [
+        (7, "EV_EFI_VARIABLE_DRIVER_CONFIG", "firmware", "dbx (dbx.esl)",
+         var(S, "dbx", {"artifact": "dbx.esl"}), "hash", uefi_variable_data(S, "dbx", files["dbx.esl"])),
+        (7, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
+        (7, "EV_EFI_VARIABLE_AUTHORITY", "firmware", "the db entry that verified stage0",
+         var(S, "db", {"concat": [{"guid": str(own["db"])}, {"artifact": "db.cer"}]}), "hash",
+         uefi_variable_data(S, "db", own["db"].bytes_le + files["db.cer"])),
+    ]
+    events: list[dict[str, Any]] = []
+    for pcr, typ, by, about, expr, mode, data in ev:
+        e: dict[str, Any] = {"pcr": pcr, "type": typ, "by": by}
+        if about:
+            e["about"] = about
+        e["derive"] = expr
+        if mode != "hash":
+            e["digest"] = mode
+        e["digests"] = {b: (authenticode(data, getattr(hashlib, b)) if mode == "authenticode"
+                            else getattr(hashlib, b)(data).digest()).hex() for b in banks}
+        events.append(e)
+    events.append({"pcr": 14, "type": "unlogged", "by": "stage0",
+                   "about": "the payload stage0 verified and runs: H_bank(sha256(payload))",
+                   "derive": {"input": "payload"}})
+    return {
+        "schema": "pcr-replay/v1",
+        "name": f"stage0 {arch}",
+        "about": "UEFI firmware and stage0, from TPM reset to the payload handoff (before "
+                 "ExitBootServices). PCR0-2 are the platform's (a platform replay file).",
+        "artifacts": {n: {"sha256": hashlib.sha256(b).hexdigest()} for n, b in files.items()},
+        "entry": efi_name,
+        "inputs": {"payload": {"about": "sha256 of the payload stage0 runs (the next stage)",
+                               "next_entry": True}},
+        "reset": list(range(3, 24)),
+        "unextended": [0, 1, 2],
+        "events": events,
+    }
 
-    out = {}
-    for bank in banks:
-        H = getattr(hashlib, bank)
-        sep = H(b"\0\0\0\0").digest()
 
-        def chain(digests):
-            v = b"\0" * H().digest_size
-            for e in digests:
-                v = H(v + e).digest()
-            return v.hex()
-
-        p = {
-            3: chain([sep]),
-            4: chain([H(b"Calling EFI Application from Boot Option").digest(), sep,
-                      authenticode(efi, H)]),
-            5: chain([sep, H(gpt).digest()]),
-            6: chain([sep]),
-            7: chain([sep if e is None else H(e).digest() for e in pcr7_events]),
-        }
-        if payload_sha256:
-            p[14] = chain([H(bytes.fromhex(payload_sha256)).digest()])
-        out[bank] = {str(k): v for k, v in sorted(p.items())}
+def reference_pcrs(rf: dict[str, Any], banks: list[str]) -> dict[str, Any]:
+    """Replay the file's embedded digests from reset: every PCR it models except PCR14."""
+    out: dict[str, dict[str, str]] = {}
+    for b in banks:
+        H = getattr(hashlib, b)
+        n = H().digest_size
+        p = {k: (b"\xff" if 17 <= k <= 22 else b"\0") * n for k in rf["reset"] if k != 14}
+        for e in rf["events"]:
+            if e["pcr"] in p:
+                p[e["pcr"]] = H(p[e["pcr"]] + bytes.fromhex(e["digests"][b])).digest()
+        out[b] = {str(k): v.hex() for k, v in sorted(p.items())}
     return {"pcrs": out}
 
 
-def check(pred, log_path):
-    with open(log_path, "rb") as f:
-        txt = f.read().decode("latin1")
-    seen = {(a, int(i)): v for a, i, v in re.findall(r"payload: PCR (\w+) (\d\d) ([0-9a-f]+)", txt)}
-    bad = 0
-    for bank, pcrs in pred["pcrs"].items():
-        for i, want in pcrs.items():
-            got = seen.get((bank, int(i)))
-            status = "ok" if got == want else ("MISSING" if got is None else "MISMATCH")
-            bad += status != "ok"
-            print(f"{bank:7} PCR{int(i):<2} {status:8} predicted {want[:16]}"
-                  + ("" if status == "ok" or got is None else f"  read {got[:16]}"))
-    print("ALL PREDICTED PCRS MATCH" if not bad else f"{bad} PREDICTED PCR(S) DO NOT MATCH")
-    return bad == 0
+def write_json(path: str, doc: dict[str, Any]) -> None:
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=2)
+        f.write("\n")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Reproduce stage0's PCRs from its release artifacts")
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Write stage0's PCR replay file (and reference PCRs)")
     ap.add_argument("dir", help="stage0 build/<arch> or extracted release directory")
-    ap.add_argument("--payload-sha256", help="also predict PCR14 for this payload digest")
     ap.add_argument("--banks", default="sha256,sha384", help="comma-separated (default sha256,sha384)")
-    ap.add_argument("--out", help="write JSON here (default stdout)")
-    ap.add_argument("--check", metavar="LOG", help="compare against a test-payload serial log")
+    ap.add_argument("--replay", required=True, help="write the pcr-replay/v1 file here")
+    ap.add_argument("--out", help="also write the reference pcrs.json here")
     a = ap.parse_args()
-    pred = predict(a.dir, a.banks.split(","), a.payload_sha256)
-    if a.check:
-        sys.exit(0 if check(pred, a.check) else 1)
-    js = json.dumps(pred, indent=2) + "\n"
+    banks = a.banks.split(",")
+    rf = replay_file(a.dir, banks)
+    write_json(a.replay, rf)
     if a.out:
-        with open(a.out, "w") as f:
-            f.write(js)
-    else:
-        sys.stdout.write(js)
+        write_json(a.out, reference_pcrs(rf, banks))
 
 
 if __name__ == "__main__":
