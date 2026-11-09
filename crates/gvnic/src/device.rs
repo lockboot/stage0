@@ -41,11 +41,6 @@ use uefi::{Event, Status};
 
 use crate::pci::{PciAttrOp, PciIoProtocol, PciMapOp, PciWidth, PCI_ATTR_BUS_MASTER};
 
-/// `uefi::println!` with a `gvnic:` prefix.
-macro_rules! log {
-    ($($a:tt)*) => { uefi::println!("gvnic: {}", format_args!($($a)*)) };
-}
-
 /// PCI identity (gve.h:26,29: PCI_VENDOR_ID_GOOGLE / PCI_DEV_ID_GVNIC).
 pub const GVNIC_VENDOR_ID: u16 = 0x1ae0;
 pub const GVNIC_DEVICE_ID: u16 = 0x0042;
@@ -372,7 +367,7 @@ impl AdminQueue {
         let st = self.exec_status(pci, cmd)?;
         let opcode = u32::from_be_bytes([cmd[0], cmd[1], cmd[2], cmd[3]]);
         if st == AQ_PASSED {
-            log!("  AQ opcode 0x{opcode:x}: PASSED");
+            vlog!("  AQ opcode 0x{opcode:x}: PASSED");
             Ok(())
         } else {
             log!("  AQ opcode 0x{opcode:x}: status 0x{st:08x}");
@@ -462,7 +457,7 @@ unsafe fn parse_describe(buf: *const u8) -> Result<Desc, Status> {
     }
     let num_opts = get_be16(buf, 30) as usize;
     let total_len = (get_be16(buf, 32) as usize).clamp(40, PAGE);
-    log!(
+    vlog!(
         "  describe: max_reg_pages={} tx_entries={} rx_entries={} default_queues={} mtu={} counters={} tx_pages_per_qpl={} rx_pages_per_qpl={} options={} total_len={}",
         d.max_registered_pages, d.tx_entries, d.rx_entries, get_be16(buf, 14), d.mtu,
         d.counters, d.tx_pages_per_qpl, get_be16(buf, 22), num_opts, total_len
@@ -486,7 +481,7 @@ unsafe fn parse_describe(buf: *const u8) -> Result<Desc, Status> {
             return Err(Status::DEVICE_ERROR);
         }
         let mask = if len >= 4 { get_be32(buf, p) } else { 0 };
-        log!("  option 0x{id:x} len={len} required_features=0x{req:x} mask=0x{mask:x}");
+        vlog!("  option 0x{id:x} len={len} required_features=0x{req:x} mask=0x{mask:x}");
         if req == 0 {
             match id {
                 OPT_GQI_QPL if len >= 4 => gqi_qpl_mask = Some(mask),
@@ -511,7 +506,7 @@ unsafe fn parse_describe(buf: *const u8) -> Result<Desc, Status> {
         }
     };
     if !other_formats.is_empty() {
-        log!("  describe: also offered {other_formats:x?}; using GQI_QPL");
+        vlog!("  describe: also offered {other_formats:x?}; using GQI_QPL");
     }
     if let (Some(j), true) = (jumbo_mtu, mask & SUP_JUMBO_FRAMES != 0) {
         d.mtu = j;
@@ -664,7 +659,7 @@ impl Gvnic {
 /// device is reset, so nothing is left doing DMA.
 pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Gvnic, Status> {
     let rev = cfg_r8(pci, 0x08);
-    log!("PCI 1ae0:0042 revision {rev}");
+    vlog!("PCI 1ae0:0042 revision {rev}");
 
     // Memory decode + bus mastering; INTx disabled (Command bit 10). MSI-X left disabled.
     let st = (pci.attributes)(
@@ -673,7 +668,11 @@ pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Gvnic, Status> {
         PCI_ATTR_MEMORY | PCI_ATTR_BUS_MASTER,
         core::ptr::null_mut(),
     );
-    log!("memory+bus-master enable: {st:?}");
+    if st.is_success() {
+        vlog!("memory+bus-master enable: {st:?}");
+    } else {
+        log!("memory+bus-master enable: {st:?}");
+    }
     cfg_w16(pci, 0x04, cfg_r16(pci, 0x04) | (1 << 10));
 
     let num_msix = msix_table_size(pci);
@@ -685,7 +684,7 @@ pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Gvnic, Status> {
     let max_tx = reg_rd(pci, regs::MAX_TX_QUEUES);
     let max_rx = reg_rd(pci, regs::MAX_RX_QUEUES);
     let dev_status = reg_rd(pci, regs::DEVICE_STATUS);
-    log!("msix={num_msix} ntfy_blks={num_ntfy} max_tx={max_tx} max_rx={max_rx} device_status=0x{dev_status:x}");
+    vlog!("msix={num_msix} ntfy_blks={num_ntfy} max_tx={max_tx} max_rx={max_rx} device_status=0x{dev_status:x}");
     if max_tx == 0 || max_rx == 0 {
         return Err(Status::DEVICE_ERROR);
     }
@@ -738,8 +737,8 @@ unsafe fn bring_up(
     cmd_be64(&mut c, 8, DRIVER_INFO_LEN as u64);
     cmd_be64(&mut c, 16, info.dev);
     match aq.exec_status(pci, &c)? {
-        AQ_PASSED => log!("  verify-driver-compatibility: PASSED"),
-        AQ_UNIMPLEMENTED => log!("  verify-driver-compatibility: UNIMPLEMENTED (ok)"),
+        AQ_PASSED => vlog!("  verify-driver-compatibility: PASSED"),
+        AQ_UNIMPLEMENTED => vlog!("  verify-driver-compatibility: UNIMPLEMENTED (ok)"),
         s => {
             log!("  verify-driver-compatibility: status 0x{s:08x}");
             return Err(Status::DEVICE_ERROR);
@@ -839,7 +838,7 @@ unsafe fn bring_up(
     cmd_be16(&mut c, 54, BUF as u16); // packet_buffer_size
     aq.exec(pci, &c)?;
     let rx_db = get_be32(qres.host, 64);
-    log!("  queues: tx db={tx_db} counter={tx_ctr}  rx db={rx_db}");
+    vlog!("  queues: tx db={tx_db} counter={tx_ctr}  rx db={rx_db}");
     if tx_ctr >= d.counters {
         log!(
             "  tx counter_index {tx_ctr} out of range ({} counters)",
@@ -860,14 +859,6 @@ unsafe fn bring_up(
         }
         delay_ms(SLEEP_MS);
     }
-    log!(
-        "link {}",
-        if link {
-            "up"
-        } else {
-            "NOT up after 5s (continuing)"
-        }
-    );
 
     // Stop DMA at ExitBootServices (spec §10.3). Context leaked: lives as long as the event.
     let ctx = Box::into_raw(Box::new(EbsCtx { pci, rev }));
@@ -877,12 +868,26 @@ unsafe fn bring_up(
         Some(on_exit_boot_services),
         NonNull::new(ctx.cast()),
     ) {
-        Ok(_) => log!("ExitBootServices reset hook armed"),
+        Ok(_) => vlog!("ExitBootServices reset hook armed"),
         Err(e) => log!(
             "ExitBootServices hook FAILED: {:?} (device left running)",
             e.status()
         ),
     }
+
+    // The one line a successful probe prints by default (detail: the `verbose` feature).
+    let m = d.mac;
+    log!(
+        "1ae0:0042 rev {rev}, GQI_QPL, 1 tx/1 rx, mtu {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}",
+        d.mtu,
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        m[4],
+        m[5],
+        if link { "up" } else { "NOT up after 5s (continuing)" }
+    );
 
     let tx_slots = (d.tx_pages_per_qpl as usize * PAGE / BUF) as u32;
     let tx_counter = counters.host.add(tx_ctr as usize * 4) as *const u8;

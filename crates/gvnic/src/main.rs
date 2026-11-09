@@ -26,27 +26,35 @@
 
 extern crate alloc;
 
+#[macro_use]
+mod clock;
 mod binding;
 mod device;
 mod pci;
 mod snp;
 
+use uefi::boot;
 use uefi::prelude::*;
+use uefi::proto::loaded_image::LoadedImage;
 
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
+    // stage0's log-timestamp epoch, if it passed one (clock.rs).
+    if let Ok(li) = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()) {
+        clock::init(li.load_options_as_bytes());
+    }
     // Install the DriverBinding and return SUCCESS. Because the PE subsystem is
     // EFI_BOOT_SERVICE_DRIVER, the image stays resident after this returns; the
     // firmware (or stage0's connect_all_controllers) calls back into binding::start
     // when it connects the gVNIC controller.
     match binding::install() {
         Ok(()) => {
-            uefi::println!("gvnic: DriverBinding installed (idle until a gVNIC device binds)");
+            vlog!("DriverBinding installed (idle until a gVNIC device binds)");
             Status::SUCCESS
         }
         Err(e) => {
-            uefi::println!("gvnic: failed to install DriverBinding: {:?}", e.status());
+            log!("failed to install DriverBinding: {:?}", e.status());
             e.status()
         }
     }

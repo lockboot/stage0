@@ -5,8 +5,9 @@
 //! assume the interface is addressed. Nothing here is HTTP-specific.
 
 use uefi::boot;
+use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::network::ip4config2::Ip4Config2;
-use uefi::Status;
+use uefi::{Handle, Status};
 use uefi_raw::protocol::network::ip4_config2::Ip4Config2Policy;
 
 /// How often to poll for the DHCP lease. Fine-grained so bring-up returns promptly
@@ -58,14 +59,28 @@ fn load_embedded_drivers() {
             "stage0: loading embedded {name} driver ({} bytes)",
             image.len()
         );
+        // The driver copies the epoch in its entry point, i.e. during start_image, so a local
+        // buffer outlives its use.
+        let epoch = crate::timing::epoch();
         match crate::secauth::load_image_verified(image) {
-            Ok(handle) => match boot::start_image(handle) {
-                Ok(()) => crate::slog!("stage0: {name} driver started"),
-                Err(e) => crate::slog!("stage0: {name} start_image failed: {:?}", e.status()),
-            },
+            Ok(handle) => {
+                match set_driver_epoch(handle, &epoch).and_then(|()| boot::start_image(handle)) {
+                    Ok(()) => crate::slog!("stage0: {name} driver started"),
+                    Err(e) => crate::slog!("stage0: {name} start failed: {:?}", e.status()),
+                }
+            }
             Err(status) => crate::slog!("stage0: {name} load_image failed: {status:?}"),
         }
     }
+}
+
+/// Hand a loaded driver image stage0's log-timestamp epoch as its LoadOptions.
+fn set_driver_epoch(handle: Handle, epoch: &[u8; 16]) -> uefi::Result {
+    let mut loaded = boot::open_protocol_exclusive::<LoadedImage>(handle)?;
+    // SAFETY: `epoch` outlives the driver's read of it (its entry point, run by the
+    // start_image that follows; the protocol is closed again when `loaded` drops).
+    unsafe { loaded.set_load_options(epoch.as_ptr(), epoch.len() as u32) };
+    Ok(())
 }
 
 /// Bring the network up: connect the firmware's drivers, then obtain a DHCP lease.

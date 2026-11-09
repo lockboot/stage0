@@ -87,43 +87,29 @@ unsafe extern "efiapi" fn start(
             // the parent bus and directly), so start() is invoked a second time once we
             // already manage the device. That is benign; only log genuine failures.
             if e.status() != Status::ALREADY_STARTED {
-                uefi::println!(
-                    "gvnic: start(): open PciIo BY_DRIVER failed: {:?}",
-                    e.status()
-                );
+                log!("start(): open PciIo BY_DRIVER failed: {:?}", e.status());
             }
             return e.status();
         }
     };
-    uefi::println!("gvnic: start(): probing gVNIC device...");
+    vlog!("start(): probing gVNIC device...");
     // On any error, `pci` drops here and closes the BY_DRIVER open (releasing the device).
     let nic = match unsafe { crate::device::probe(&pci.0) } {
         Ok(nic) => nic,
         Err(e) => {
-            uefi::println!("gvnic: probe FAILED: {:?}", e);
+            log!("probe FAILED: {:?}", e);
             return e;
         }
     };
-    let mac = nic.mac();
-    uefi::println!(
-        "gvnic: probe OK mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={}",
-        mac[0],
-        mac[1],
-        mac[2],
-        mac[3],
-        mac[4],
-        mac[5],
-        nic.mtu
-    );
     // Keep PciIo open for the device's lifetime (probe stored the raw pointer in `nic`).
     core::mem::forget(pci);
     match crate::snp::install(controller, nic) {
         Ok(()) => {
-            uefi::println!("gvnic: SNP installed on controller; networking should come up");
+            vlog!("SNP installed on controller; networking should come up");
             Status::SUCCESS
         }
         Err(e) => {
-            uefi::println!("gvnic: SNP install failed: {:?}", e.status());
+            log!("SNP install failed: {:?}", e.status());
             e.status()
         }
     }

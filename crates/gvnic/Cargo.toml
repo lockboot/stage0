@@ -12,6 +12,10 @@ description = "UEFI SimpleNetworkProtocol driver for the Google Virtual NIC (gVN
 # the image stays resident.
 [workspace]
 
+[features]
+# Step-by-step probe/AQ logging (clock.rs vlog!); default prints errors + one summary line.
+verbose = []
+
 [dependencies]
 uefi = { version = "0.35", features = ["alloc", "global_allocator", "panic_handler"] }
 uefi-raw = "0.11"

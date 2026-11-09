@@ -72,6 +72,16 @@ pub fn since_boot_ms() -> u64 {
     raw().wrapping_sub(START.load(Ordering::Relaxed)) / per_ms
 }
 
+/// This timeline's epoch for an embedded driver's `LoadOptions`: the raw counter value at t = 0
+/// and the calibrated cycles per millisecond, each a little-endian u64. The driver reads the
+/// same counter, so its log stamps land on stage0's timeline (gvnic `clock.rs`).
+pub fn epoch() -> [u8; 16] {
+    let mut e = [0u8; 16];
+    e[..8].copy_from_slice(&START.load(Ordering::Relaxed).to_le_bytes());
+    e[8..].copy_from_slice(&CYCLES_PER_MS.load(Ordering::Relaxed).to_le_bytes());
+    e
+}
+
 /// A `[   S.mmm]`-style stamp (seconds.milliseconds since [`init`]). Returns a
 /// `Display` wrapper so the [`slog!`](crate::slog) macro formats without allocating.
 pub fn stamp() -> Stamp {

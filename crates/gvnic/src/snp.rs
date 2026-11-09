@@ -136,7 +136,7 @@ unsafe extern "efiapi" fn initialize(
     }
     d.nic.init_rx();
     d.mode.state = NetworkState::INITIALIZED;
-    uefi::println!("gvnic: SNP initialized (rx posted, link up)");
+    vlog!("SNP initialized (rx posted, link up)");
     Status::SUCCESS
 }
 
