@@ -75,6 +75,8 @@ pub fn install(controller: Handle, nic: Gvnic) -> uefi::Result<()> {
             &SNP_GUID,
             (&(*p).snp as *const SimpleNetworkProtocol).cast(),
         )?;
+        // The device now has a fixed home: arm its ExitBootServices teardown.
+        crate::device::arm_exit_boot_services(&mut (*p).nic);
     }
     Ok(())
 }

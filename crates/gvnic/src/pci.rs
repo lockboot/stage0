@@ -94,6 +94,15 @@ type FreeBufferFn = unsafe extern "efiapi" fn(
     host_address: *mut c_void,
 ) -> Status;
 
+/// `GetBarAttributes(This, BarIndex, Supports, Resources)`: `*Resources` is a pool buffer of ACPI
+/// address-space descriptors (end tag 0x79) that the caller frees.
+pub type GetBarAttributesFn = unsafe extern "efiapi" fn(
+    this: *const PciIoProtocol,
+    bar_index: u8,
+    supports: *mut u64,
+    resources: *mut *mut c_void,
+) -> Status;
+
 type AttributesFn = unsafe extern "efiapi" fn(
     this: *const PciIoProtocol,
     operation: PciAttrOp,
@@ -130,7 +139,7 @@ pub struct PciIoProtocol {
     flush: usize,
     get_location: usize,
     pub attributes: AttributesFn,
-    get_bar_attributes: usize,
+    pub get_bar_attributes: GetBarAttributesFn,
     set_bar_attributes: usize,
     pub rom_size: u64,
     pub rom_image: *mut c_void,

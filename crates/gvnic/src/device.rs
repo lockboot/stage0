@@ -12,6 +12,13 @@
 //! interrupts), no offloads, no RSS. Everything device-facing is BIG-endian: BAR0
 //! registers, admin-queue commands, descriptors, doorbells, event counters.
 //!
+//! BAR0 (registers) goes through `PciIo.Mem`; BAR2 (queue doorbells) is written with direct
+//! stores to the BAR's host address, as every reference driver does (Linux iowrite32be,
+//! FreeBSD bus_write_4, DPDK rte_write32, iPXE's EFI build writel). GCE backs the doorbell BAR
+//! as memory rather than trapping MMIO: under Intel TDX the firmware's `PciIo.Mem` path is a
+//! TDVMCALL MMIO hypercall that never reaches it (writes dropped, reads 0), while a direct store
+//! through the firmware's shared MMIO mapping does.
+//!
 //! Flow (probe): PCI enable -> version string -> register admin queue (by PCI revision) ->
 //! VERIFY_DRIVER_COMPATIBILITY -> DESCRIBE_DEVICE (+ option TLVs) ->
 //! CONFIGURE_DEVICE_RESOURCES -> allocate rings + QPLs -> REGISTER_PAGE_LIST (TX, RX) ->
@@ -29,7 +36,6 @@
 // few protocol constants are kept for reference.
 #![allow(dead_code)]
 
-use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -78,6 +84,12 @@ const OP_CONFIGURE_DEVICE_RESOURCES: u32 = 0x2;
 const OP_REGISTER_PAGE_LIST: u32 = 0x3;
 const OP_CREATE_TX_QUEUE: u32 = 0x5;
 const OP_CREATE_RX_QUEUE: u32 = 0x6;
+const OP_UNREGISTER_PAGE_LIST: u32 = 0x4;
+const OP_DESTROY_TX_QUEUE: u32 = 0x7;
+const OP_DESTROY_RX_QUEUE: u32 = 0x8;
+const OP_DECONFIGURE_DEVICE_RESOURCES: u32 = 0x9;
+/// TX QPL id (Linux's: TX QPLs are numbered from 0).
+const TX_QPL_ID: u32 = 0;
 const OP_VERIFY_DRIVER_COMPATIBILITY: u32 = 0xf;
 
 /// Admin status codes (gve_adminq.h:47-66).
@@ -222,9 +234,34 @@ unsafe fn reg_wr(pci: &PciIoProtocol, off: u64, v: u32) {
 }
 /// Ring doorbell `db_index` (BAR2 + 4*db_index) with a free-running count. Release fence
 /// first, so every descriptor/payload store is visible before the device is told.
-unsafe fn doorbell(pci: &PciIoProtocol, db_index: u32, value: u32) {
+unsafe fn doorbell(db: *mut u8, db_index: u32, value: u32) {
     fence(Ordering::Release);
-    mmio_write32(pci, DB_BAR, 4 * db_index as u64, value);
+    (db.add(4 * db_index as usize) as *mut u32).write_volatile(value.to_be());
+}
+
+/// Host address and length of memory BAR `bar`, from `PciIo.GetBarAttributes` (its first
+/// memory descriptor; host = AddrRangeMin - AddrTranslationOffset, EDK2 TO_HOST_ADDRESS).
+unsafe fn bar_host_range(pci: &PciIoProtocol, bar: u8) -> Result<(u64, u64), Status> {
+    let mut res: *mut c_void = core::ptr::null_mut();
+    let st = (pci.get_bar_attributes)(pci, bar, core::ptr::null_mut(), &mut res);
+    if !st.is_success() || res.is_null() {
+        log!("GetBarAttributes(bar{bar}) failed: {st:?}");
+        return Err(if st.is_success() {
+            Status::DEVICE_ERROR
+        } else {
+            st
+        });
+    }
+    // ACPI QWORD address-space descriptor (0x8A): ResType @3, AddrRangeMin @14,
+    // AddrTranslationOffset @30, AddrLen @38 (packed).
+    let p = res as *const u8;
+    let rd = |o: usize| (p.add(o) as *const u64).read_unaligned();
+    let found = (*p == 0x8a && *p.add(3) == 0).then(|| (rd(14).wrapping_sub(rd(30)), rd(38)));
+    let _ = boot::free_pool(NonNull::new_unchecked(res as *mut u8));
+    found.ok_or_else(|| {
+        log!("bar{bar}: no memory descriptor");
+        Status::DEVICE_ERROR
+    })
 }
 
 unsafe fn cfg_r8(pci: &PciIoProtocol, off: u32) -> u8 {
@@ -414,17 +451,34 @@ unsafe fn reset(pci: &PciIoProtocol, rev: u8) -> bool {
 
 // ---- ExitBootServices: stop DMA before the OS owns the memory ---------------------------
 
-struct EbsCtx {
-    pci: *const PciIoProtocol,
-    rev: u8,
-}
-
-/// Reset the device at ExitBootServices (spec §10.3): RX buffers are posted into
-/// boot-services memory the OS is about to reuse. No logging here (console may be gone).
+/// Tear the device down at ExitBootServices, as Linux does on close + remove (gve_close ->
+/// gve_destroy_rings + gve_unregister_qpls, gve_teardown_device_resources, gve_adminq_release):
+/// destroy the queues, unregister both page lists, deconfigure the device resources, then reset.
+/// The device must let go of every page it was given before the firmware IOMMU's own EBS
+/// handler (TPL_CALLBACK, after this one at TPL_NOTIFY) converts them back to private memory --
+/// RX buffers are posted into boot-services memory the OS is about to reuse. Admin-queue commands
+/// use pre-allocated DMA memory and Stall-based polling only (no allocation, as EBS requires). A
+/// failed command surrenders to the reset, as gve_close does. No logging (console may be gone).
 unsafe extern "efiapi" fn on_exit_boot_services(_e: Event, ctx: Option<NonNull<c_void>>) {
     if let Some(c) = ctx {
-        let c = &*(c.as_ptr() as *const EbsCtx);
-        let _ = reset(&*c.pci, c.rev);
+        (*(c.as_ptr() as *mut Gvnic)).teardown();
+    }
+}
+
+/// Arm the ExitBootServices teardown for `nic`, which must stay at this address (the SNP
+/// device it lives in is leaked) for the life of boot services.
+pub unsafe fn arm_exit_boot_services(nic: *mut Gvnic) {
+    match boot::create_event(
+        EventType::SIGNAL_EXIT_BOOT_SERVICES,
+        Tpl::NOTIFY,
+        Some(on_exit_boot_services),
+        NonNull::new(nic.cast()),
+    ) {
+        Ok(_) => vlog!("ExitBootServices teardown armed"),
+        Err(e) => log!(
+            "ExitBootServices hook FAILED: {:?} (device left running)",
+            e.status()
+        ),
     }
 }
 
@@ -543,6 +597,10 @@ struct Rx {
 /// A bound gVNIC: one TX + one RX GQI-QPL queue, polled.
 pub struct Gvnic {
     pci: *const PciIoProtocol,
+    /// Host address of BAR2 (doorbells), written directly (see the module docs).
+    db: *mut u8,
+    /// RX QPL id (TX is [`TX_QPL_ID`]), for unregistering at teardown.
+    rx_qpl_id: u32,
     /// Device MTU (L3 payload; GCP default 1460), capped so a frame fits one 2 KiB buffer.
     pub mtu: u32,
     mac: [u8; 6],
@@ -560,6 +618,28 @@ impl Gvnic {
         self.mac
     }
 
+    /// Release everything the device holds, then reset it (see [`on_exit_boot_services`]).
+    unsafe fn teardown(&mut self) {
+        let pci = &*self.pci;
+        let steps: [(u32, Option<u32>); 5] = [
+            (OP_DESTROY_TX_QUEUE, Some(0)),
+            (OP_DESTROY_RX_QUEUE, Some(0)),
+            (OP_UNREGISTER_PAGE_LIST, Some(TX_QPL_ID)),
+            (OP_UNREGISTER_PAGE_LIST, Some(self.rx_qpl_id)),
+            (OP_DECONFIGURE_DEVICE_RESOURCES, None),
+        ];
+        for (op, id) in steps {
+            let mut c = cmd_new(op);
+            if let Some(id) = id {
+                cmd_be32(&mut c, 8, id);
+            }
+            if self.aq.exec(pci, &c).is_err() {
+                break; // surrender to the reset (gve_close)
+            }
+        }
+        let _ = reset(pci, self.rev);
+    }
+
     /// RX is fully posted at probe (the data ring must be prefilled before CREATE_RX_QUEUE,
     /// spec §4.7), so SNP Initialize has nothing to do here.
     pub unsafe fn init_rx(&mut self) {}
@@ -567,7 +647,7 @@ impl Gvnic {
     /// Copy one received frame into `out` (capacity `cap`); `None` if nothing is pending.
     /// Errored, multi-fragment, or oversized frames are consumed and dropped.
     pub unsafe fn receive(&mut self, out: *mut u8, cap: usize) -> Option<usize> {
-        let pci = &*self.pci;
+        let db = self.db;
         let rx = &mut self.rx;
         loop {
             let idx = (rx.cnt % rx.entries) as usize;
@@ -596,7 +676,7 @@ impl Gvnic {
             rx.cnt = rx.cnt.wrapping_add(1);
             rx.seq = if rx.seq == 7 { 1 } else { rx.seq + 1 };
             rx.fill = rx.fill.wrapping_add(1);
-            doorbell(pci, rx.db_index, rx.fill);
+            doorbell(db, rx.db_index, rx.fill);
             if got.is_some() {
                 return got;
             }
@@ -611,7 +691,6 @@ impl Gvnic {
         len: usize,
         caller: *const c_void,
     ) -> Result<(), Status> {
-        let pci = &*self.pci;
         let tx = &mut self.tx;
         if len == 0 || len > self.mtu as usize + ETH_HLEN {
             return Err(Status::INVALID_PARAMETER);
@@ -635,7 +714,7 @@ impl Gvnic {
         put_be64(d, 8, qpl_off as u64);
         tx.callers[slot] = caller;
         tx.req = tx.req.wrapping_add(1);
-        doorbell(pci, tx.db_index, tx.req);
+        doorbell(self.db, tx.db_index, tx.req);
         Ok(())
     }
 
@@ -693,6 +772,9 @@ pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Gvnic, Status> {
         mmio_write8(pci, REG_BAR, regs::DRIVER_VERSION, *b);
     }
 
+    // Before the admin queue exists, so a failure here leaves nothing to reset.
+    let (db_base, db_len) = bar_host_range(pci, DB_BAR)?;
+
     let aq_dma = Dma::alloc(pci, PAGE)?;
     register_adminq(pci, rev, &aq_dma);
     let ec = reg_rd(pci, regs::ADMINQ_EVENT_COUNTER);
@@ -704,7 +786,7 @@ pub unsafe fn probe(pci: &PciIoProtocol) -> Result<Gvnic, Status> {
         prod: ec,
     };
 
-    match bring_up(pci, rev, num_ntfy, max_tx, aq) {
+    match bring_up(pci, rev, num_ntfy, max_tx, aq, db_base as *mut u8, db_len) {
         Ok(nic) => Ok(nic),
         Err(e) => {
             let ok = reset(pci, rev);
@@ -724,6 +806,8 @@ unsafe fn bring_up(
     num_ntfy: u32,
     max_tx: u32,
     mut aq: AdminQueue,
+    db: *mut u8,
+    db_len: u64,
 ) -> Result<Gvnic, Status> {
     // VERIFY_DRIVER_COMPATIBILITY (spec §4.1): PASSED or UNIMPLEMENTED both fine.
     let info = Dma::alloc(pci, DRIVER_INFO_LEN)?;
@@ -795,7 +879,7 @@ unsafe fn bring_up(
     }
 
     // REGISTER_PAGE_LIST (spec §4.5): TX id 0, RX id min(max_tx, ntfy/2) (Linux's values).
-    let tx_qpl_id = 0u32;
+    let tx_qpl_id = TX_QPL_ID;
     let rx_qpl_id = max_tx.min(num_ntfy / 2);
     for (id, qpl, pages) in [
         (tx_qpl_id, &tx_qpl, d.tx_pages_per_qpl),
@@ -846,9 +930,16 @@ unsafe fn bring_up(
         );
         return Err(Status::DEVICE_ERROR);
     }
+    // The doorbells are written through a raw pointer: keep the device's indices inside BAR2.
+    for (q, idx) in [("tx", tx_db), ("rx", rx_db)] {
+        if 4 * idx as u64 + 4 > db_len {
+            log!("  {q} doorbell index {idx} outside BAR2 ({db_len} bytes)");
+            return Err(Status::DEVICE_ERROR);
+        }
+    }
 
     // Post every RX slot (spec §7.2 step 6).
-    doorbell(pci, rx_db, d.rx_entries);
+    doorbell(db, rx_db, d.rx_entries);
 
     // Link (spec §2.5): Linux does not wait; we poll briefly and log.
     let mut link = false;
@@ -858,21 +949,6 @@ unsafe fn bring_up(
             break;
         }
         delay_ms(SLEEP_MS);
-    }
-
-    // Stop DMA at ExitBootServices (spec §10.3). Context leaked: lives as long as the event.
-    let ctx = Box::into_raw(Box::new(EbsCtx { pci, rev }));
-    match boot::create_event(
-        EventType::SIGNAL_EXIT_BOOT_SERVICES,
-        Tpl::NOTIFY,
-        Some(on_exit_boot_services),
-        NonNull::new(ctx.cast()),
-    ) {
-        Ok(_) => vlog!("ExitBootServices reset hook armed"),
-        Err(e) => log!(
-            "ExitBootServices hook FAILED: {:?} (device left running)",
-            e.status()
-        ),
     }
 
     // The one line a successful probe prints by default (detail: the `verbose` feature).
@@ -893,6 +969,8 @@ unsafe fn bring_up(
     let tx_counter = counters.host.add(tx_ctr as usize * 4) as *const u8;
     Ok(Gvnic {
         pci,
+        db,
+        rx_qpl_id,
         mtu,
         mac: d.mac,
         rev,
