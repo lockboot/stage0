@@ -22,6 +22,9 @@
 #               logged. An input (the payload is the deployment's choice).
 #   PCR8-13, 15-23  not extended.
 #
+# Events are written in the firmware's log order, not grouped by PCR, so that a platform file
+# routing some of them elsewhere (GCE TDX logs the GPT and BOOT*.EFI into PCR2) keeps their order.
+#
 # Not modelled: PCR0-2 (provider firmware code, firmware boot entries, option ROMs). They are the
 # platform's, inside the trust boundary its vTPM already implies, and change with its firmware
 # updates: a per-platform replay file (golden readings) supplies them.
@@ -138,16 +141,10 @@ def replay_file(d: str, banks: list[str]) -> dict[str, Any]:
     sep_expr = {"hex": SEPARATOR.hex()}
     # (pcr, type, by, about, derivation, digest mode, bytes for the local computation)
     G, S = mv.EFI_GLOBAL_VARIABLE, mv.IMAGE_SECURITY_DATABASE
+    # In the firmware's log order (OVMF and GCE alike), not grouped by PCR: only the order within a
+    # PCR affects its value, but a platform that routes some of these events into another PCR (GCE
+    # TDX: GPT and BOOT*.EFI into PCR2) needs them in the order they really reach it.
     ev: list[tuple[int, str, str, str, dict[str, Any], str, bytes]] = [
-        (3, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
-        (4, "EV_EFI_ACTION", "firmware", "boot option dispatch", {"utf8": CALLING}, "hash", CALLING.encode()),
-        (4, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
-        (4, "EV_EFI_BOOT_SERVICES_APPLICATION", "firmware", f"stage0 ({efi_name}, Authenticode)",
-         {"artifact": efi_name}, "authenticode", files[efi_name]),
-        (5, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
-        (5, "EV_EFI_GPT_EVENT", "firmware", "UEFI_GPT_DATA of boot.disk",
-         {"gpt": {"artifact": "boot.disk"}}, "hash", gpt),
-        (6, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
         (7, "EV_EFI_VARIABLE_DRIVER_CONFIG", "firmware", "SecureBoot = 1",
          var(G, "SecureBoot", {"hex": "01"}), "hash", uefi_variable_data(G, "SecureBoot", b"\x01")),
     ]
@@ -159,9 +156,18 @@ def replay_file(d: str, banks: list[str]) -> dict[str, Any]:
         (7, "EV_EFI_VARIABLE_DRIVER_CONFIG", "firmware", "dbx (dbx.esl)",
          var(S, "dbx", {"artifact": "dbx.esl"}), "hash", uefi_variable_data(S, "dbx", files["dbx.esl"])),
         (7, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
+        (4, "EV_EFI_ACTION", "firmware", "boot option dispatch", {"utf8": CALLING}, "hash", CALLING.encode()),
+        (3, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
+        (4, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
+        (5, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
+        (6, "EV_SEPARATOR", "firmware", "", sep_expr, "hash", SEPARATOR),
         (7, "EV_EFI_VARIABLE_AUTHORITY", "firmware", "the db entry that verified stage0",
          var(S, "db", {"concat": [{"guid": str(own["db"])}, {"artifact": "db.cer"}]}), "hash",
          uefi_variable_data(S, "db", own["db"].bytes_le + files["db.cer"])),
+        (5, "EV_EFI_GPT_EVENT", "firmware", "UEFI_GPT_DATA of boot.disk",
+         {"gpt": {"artifact": "boot.disk"}}, "hash", gpt),
+        (4, "EV_EFI_BOOT_SERVICES_APPLICATION", "firmware", f"stage0 ({efi_name}, Authenticode)",
+         {"artifact": efi_name}, "authenticode", files[efi_name]),
     ]
     events: list[dict[str, Any]] = []
     for pcr, typ, by, about, expr, mode, data in ev:
