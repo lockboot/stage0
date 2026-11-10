@@ -24,6 +24,8 @@ mod config;
 mod dns4;
 mod embedded;
 mod http;
+#[cfg(target_arch = "x86_64")]
+mod lapic_tick;
 mod metadata;
 mod net;
 mod secauth;
@@ -85,6 +87,10 @@ fn run() -> Result<(), Status> {
     // Calibrate the boot-relative clock first so every log line below is stamped.
     timing::init();
     crate::slog!("stage0: version: {}", env!("CARGO_PKG_VERSION"));
+    // Before anything event-driven (the network stack runs on timer events): supply a LAPIC tick
+    // if the firmware's own never arrives (GCE's PIT-driven firmware under Intel TDX).
+    #[cfg(target_arch = "x86_64")]
+    lapic_tick::ensure();
 
     // Fail closed unless the platform is in the state the attestation model assumes: UEFI Secure
     // Boot enforcing -- SecureBoot on, not in Setup Mode, not in Audit Mode. User and Deployed Mode
