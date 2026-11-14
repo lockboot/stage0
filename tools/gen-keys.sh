@@ -18,7 +18,11 @@ for name in PK KEK db; do
         -keyout "$OUT/$name.crt.key" -new -x509 -sha256 -days 3650 \
         -subj "/CN=Lock.Boot/" -out "$OUT/$name.crt"
     openssl x509 -outform DER -in "$OUT/$name.crt" -out "$OUT/$name.cer"
-    uuidgen > "$OUT/$name.guid"
+    # Signature owner GUID: the fixed one GCP stamps on every X.509 cert it wraps into an
+    # EFI_SIGNATURE_LIST for PK/KEK/db (undocumented; seen in GCE event logs 2022-2026). Using
+    # it here makes our efi-vars.* ESLs byte-identical to what GCP enrolls from the .cer files,
+    # so PCR7 is one value on QEMU, EC2 and GCP. Metadata only: never used for verification.
+    echo d281fad2-8d88-47a4-9792-5baa47bb1b89 > "$OUT/$name.guid"
 done
 
 echo "Secure Boot keys written to $OUT (PK, KEK, db)"

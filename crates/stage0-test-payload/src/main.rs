@@ -23,7 +23,8 @@ use uefi::prelude::*;
 use uefi::println;
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::tcg::v2::Tcg;
-use uefi::runtime::{self, ResetType};
+use uefi::runtime::{self, ResetType, VariableAttributes, VariableVendor};
+use uefi::CStr16;
 use vaportpm_attest::{PcrOps, TpmTransport};
 
 struct Tcg2Transport {
@@ -54,9 +55,24 @@ fn main() -> Status {
     uefi::helpers::init().unwrap();
     println!("payload: hello from the chain-loaded UEFI payload");
 
+    // Secure Boot mode variables as the firmware reports them this boot (value + attributes, or
+    // absent): what stage0's gate saw, and whether the firmware implements the UEFI 2.5 modes.
+    print_mode_vars();
+
     match print_pcrs() {
         Ok(()) => {}
         Err(e) => println!("payload: could not read PCRs: {e}"),
+    }
+    // Best effort: some firmware (EC2) does not hand out its log; the PCR dump above stands alone.
+    if let Err(e) = print_event_log() {
+        println!("payload: could not read TCG2 event log: {e}");
+    }
+
+    // Experiment: attempt the User -> Deployed Mode transition from here (pre-ExitBootServices,
+    // the same position stage0 would do it from), AFTER this boot's PCRs were dumped, so the next
+    // boot (`--reboot`) shows whether it persisted and whether PCR 7 moved.
+    if load_options_contains("--set-deployed") {
+        set_deployed_mode();
     }
 
     // EC2's serial console buffer is only flushed periodically; if the payload terminates
@@ -75,7 +91,70 @@ fn main() -> Status {
     // A test payload never boots an OS, so it never needs to hand control back to stage0. Power
     // off cleanly instead of returning: a return makes stage0 treat it as an unexpected
     // fall-through and run its own (~90s) fail-closed drain, needlessly slowing the boot.
+    // `--reboot` cold-resets instead, for one PCR dump per boot on the same instance (cross-boot
+    // stability). It loops until the instance is stopped/deleted -- bound it externally (e.g.
+    // GCP --max-run-duration).
+    if load_options_contains("--reboot") {
+        println!("payload: --reboot: cold reset");
+        runtime::reset(ResetType::COLD, Status::SUCCESS, None)
+    }
     runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None)
+}
+
+/// Read a UEFI global variable: `Some((first byte, attributes))`, or `None` if absent/unreadable.
+fn global_var(name: &CStr16) -> Option<(u8, VariableAttributes)> {
+    let mut buf = [0u8; 8];
+    runtime::get_variable(name, &VariableVendor::GLOBAL_VARIABLE, &mut buf)
+        .ok()
+        .and_then(|(data, attrs)| data.first().map(|b| (*b, attrs)))
+}
+
+/// One line per mode variable: "payload: mode <Name>=<value> attrs=0x<bits>" or "=absent".
+fn print_mode_vars() {
+    for name in [
+        uefi::cstr16!("SecureBoot"),
+        uefi::cstr16!("SetupMode"),
+        uefi::cstr16!("AuditMode"),
+        uefi::cstr16!("DeployedMode"),
+    ] {
+        match global_var(name) {
+            Some((v, a)) => println!("payload: mode {name}={v} attrs=0x{:02x}", a.bits()),
+            None => println!("payload: mode {name}=absent"),
+        }
+    }
+}
+
+/// Try `DeployedMode = 1`, first with the UEFI-spec attributes (BS|RT), then NV|BS|RT; report
+/// each SetVariable status and the read-back. Experiment only: says whether the firmware allows
+/// the transition from a pre-ExitBootServices image, not whether it is irreversible.
+fn set_deployed_mode() {
+    if matches!(global_var(uefi::cstr16!("DeployedMode")), Some((1, _))) {
+        println!("payload: --set-deployed: already DeployedMode=1, nothing to do");
+        return;
+    }
+    let bs_rt = VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS;
+    for (label, attrs) in [
+        ("BS|RT", bs_rt),
+        ("NV|BS|RT", bs_rt | VariableAttributes::NON_VOLATILE),
+    ] {
+        let r = runtime::set_variable(
+            uefi::cstr16!("DeployedMode"),
+            &VariableVendor::GLOBAL_VARIABLE,
+            attrs,
+            &[1u8],
+        );
+        match r {
+            Ok(()) => {
+                println!("payload: --set-deployed: SetVariable({label}) = SUCCESS");
+                break;
+            }
+            Err(e) => println!(
+                "payload: --set-deployed: SetVariable({label}) = {:?}",
+                e.status()
+            ),
+        }
+    }
+    print_mode_vars();
 }
 
 /// True if this image's UEFI LoadOptions (set by stage0 from `_stage1.args` / a signed manifest)
@@ -131,5 +210,42 @@ fn print_pcrs() -> Result<()> {
         );
     }
     println!("payload: ===PCR-DUMP-END===");
+    Ok(())
+}
+
+/// Dump the firmware's TCG2 (crypto-agile) event log, so the PCR predictor's event sequence can
+/// be checked against what the firmware actually measured. Per event, bracketed by stable markers:
+///   payload: EV <n> <pcr> <type-hex>
+///   payload: EVD <n> <alg-id-hex> <digest-hex>      (one per bank)
+///   payload: EVX <n> <hex>                          (event data, <= 64 bytes per line, in order)
+fn print_event_log() -> Result<()> {
+    let handle = boot::get_handle_for_protocol::<Tcg>()
+        .map_err(|e| anyhow!("no EFI_TCG2_PROTOCOL: {:?}", e.status()))?;
+    let mut tcg = boot::open_protocol_exclusive::<Tcg>(handle)
+        .map_err(|e| anyhow!("open EFI_TCG2_PROTOCOL: {:?}", e.status()))?;
+    let log = tcg
+        .get_event_log_v2()
+        .map_err(|e| anyhow!("GetEventLog(TCG_2): {:?}", e.status()))?;
+
+    println!("payload: ===EVENTLOG-BEGIN===");
+    let mut n = 0usize;
+    for ev in log.iter() {
+        println!(
+            "payload: EV {n} {} {:08x}",
+            ev.pcr_index().0,
+            ev.event_type().0
+        );
+        for (alg, digest) in ev.digests() {
+            println!("payload: EVD {n} {:04x} {}", alg.0, hex::encode(digest));
+        }
+        for chunk in ev.event_data().chunks(64) {
+            println!("payload: EVX {n} {}", hex::encode(chunk));
+        }
+        n += 1;
+    }
+    println!(
+        "payload: ===EVENTLOG-END=== events={n} truncated={}",
+        log.is_truncated()
+    );
     Ok(())
 }

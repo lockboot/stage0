@@ -19,8 +19,13 @@ else
     exit 1
 fi
 
+# Optional leading --manifest <f>: append the created instance ("gcp instance <project>
+# <zone>/<name>") for cleanup.sh. GCP instances do NOT self-delete when stage0 powers off.
+MANIFEST=""
+if [ "${1:-}" = "--manifest" ]; then MANIFEST="${2:?--manifest needs a value}"; shift 2; fi
+
 if [ $# -lt 5 ]; then
-    echo "Usage: $0 <instance-name> <zone> <machine-type> <image> <user-data-file> [additional-options...]"
+    echo "Usage: $0 [--manifest <f>] <instance-name> <zone> <machine-type> <image> <user-data-file> [additional-options...]"
     echo ""
     echo "Examples:"
     echo "  # Launch x86_64 instance"
@@ -30,9 +35,9 @@ if [ $# -lt 5 ]; then
     echo "  $0 my-vm us-central1-a t2a-standard-1 lockboot-aarch64 config.json --network=my-vpc"
     echo ""
     echo "Recommended machine types:"
-    echo "  x86_64 SEV-SNP: n2d-standard-2, n2d-standard-4, c2d-standard-*"
+    echo "  x86_64 SEV-SNP: n2d-standard-2, n2d-standard-4  (SEV only: c2d-standard-*)"
     echo "  x86_64 TDX:     c3-standard-*"
-    echo "  aarch64:        t2a-standard-1, t2a-standard-2, t2a-standard-4"
+    echo "  aarch64:        t2a-standard-1, t2a-standard-2, t2a-standard-4  (Shielded VM, not confidential)"
     echo ""
     echo "Common zones: us-central1-a, us-east1-b, europe-west1-b"
     echo ""
@@ -77,22 +82,25 @@ echo "Image:     ${IMAGE}"
 echo "User-data: ${USER_DATA_FILE}"
 echo ""
 
-# Validate machine type supports Confidential Compute
-if [[ "${MACHINE_TYPE}" =~ ^n2d- ]] || [[ "${MACHINE_TYPE}" =~ ^c2d- ]]; then
-    TECH="AMD SEV-SNP"
+# Confidential-compute flags per machine family (non-interactive: unknown families are refused).
+#   n2d -> SEV-SNP: needs an AMD Milan-or-later host, so pin --min-cpu-platform
+#   c2d -> SEV
+#   c3  -> TDX
+#   t2a -> no documented Arm Confidential VM series: Shielded VM only (secure boot + vTPM +
+#          integrity). To try a confidential type (experiment G2), pass it in the trailing
+#          options, e.g. --confidential-compute-type=CCA.
+# (The deprecated bare --confidential-compute flag means SEV and is not used.)
+if [[ "${MACHINE_TYPE}" =~ ^n2d- ]]; then
+    TECH="AMD SEV-SNP"; CONF_ARGS=(--confidential-compute-type=SEV_SNP --min-cpu-platform="AMD Milan")
+elif [[ "${MACHINE_TYPE}" =~ ^c2d- ]]; then
+    TECH="AMD SEV";     CONF_ARGS=(--confidential-compute-type=SEV)
 elif [[ "${MACHINE_TYPE}" =~ ^c3- ]]; then
-    TECH="Intel TDX"
+    TECH="Intel TDX";   CONF_ARGS=(--confidential-compute-type=TDX)
 elif [[ "${MACHINE_TYPE}" =~ ^t2a- ]]; then
-    TECH="ARM TrustZone"
+    TECH="none (Shielded VM only)"; CONF_ARGS=()
 else
-    echo "Warning: Machine type '${MACHINE_TYPE}' may not support Confidential Computing"
-    echo "Recommended: n2d-*, c2d-*, c3-*, or t2a-*"
-    read -p "Continue anyway? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
-    TECH="Unknown"
+    echo "Error: unsupported machine type '${MACHINE_TYPE}' (use n2d-*, c2d-*, c3-*, or t2a-*)"
+    exit 1
 fi
 
 echo "Confidential Compute: ${TECH}"
@@ -110,8 +118,9 @@ if [ -n "${EXISTING}" ]; then
     exit 1
 fi
 
-echo "Creating instance with REQUIRED Confidential VM settings:"
-echo "  ✓ --confidential-compute-type    (enables memory encryption)"
+echo "Creating instance with REQUIRED settings:"
+echo "  ✓ ${CONF_ARGS[*]:-(no confidential type: Shielded VM only)}"
+echo "  ✓ --no-service-account --no-scopes (no cloud credentials reachable from the guest)"
 echo "  ✓ --maintenance-policy=TERMINATE (prevents live migration)"
 echo "  ✓ --shielded-secure-boot         (UEFI Secure Boot)"
 echo "  ✓ --shielded-vtpm                (virtual TPM 2.0)"
@@ -120,55 +129,26 @@ echo "  ✓ --boot-disk-type=pd-standard  (cheapest, loaded once into memory)"
 echo "  ✓ --boot-disk-auto-delete        (cleanup on instance delete)"
 echo ""
 
-# Determine confidential compute type based on machine type
-if [[ "${MACHINE_TYPE}" =~ ^c3- ]]; then
-    CONF_COMPUTE_TYPE="TDX"
-elif [[ "${MACHINE_TYPE}" =~ ^(n2d-|c2d-) ]]; then
-    CONF_COMPUTE_TYPE="SEV"
-elif [[ "${MACHINE_TYPE}" =~ ^t2a- ]]; then
-    # ARM doesn't need explicit type
-    CONF_COMPUTE_TYPE=""
-else
-    CONF_COMPUTE_TYPE="SEV"  # Default to SEV
-fi
-
-# Launch instance with all required Confidential VM settings
-if [ -n "${CONF_COMPUTE_TYPE}" ]; then
-    ${GCLOUD} compute instances create "${INSTANCE_NAME}" \
-        --project="${PROJECT}" \
-        --zone="${ZONE}" \
-        --machine-type="${MACHINE_TYPE}" \
-        --image="${IMAGE}" \
-        --network-interface=nic-type=GVNIC \
-        --boot-disk-type=pd-standard \
-        --boot-disk-auto-delete \
-        --metadata-from-file=user-data="${USER_DATA_FILE}" \
-        --metadata=serial-port-enable=true \
-        --confidential-compute-type="${CONF_COMPUTE_TYPE}" \
-        --maintenance-policy=TERMINATE \
-        --shielded-secure-boot \
-        --shielded-vtpm \
-        --shielded-integrity-monitoring \
-        "$@"
-else
-    # ARM: use old flag for now (TODO: check if ARM needs specific type)
-    ${GCLOUD} compute instances create "${INSTANCE_NAME}" \
-        --project="${PROJECT}" \
-        --zone="${ZONE}" \
-        --machine-type="${MACHINE_TYPE}" \
-        --image="${IMAGE}" \
-        --network-interface=nic-type=GVNIC \
-        --boot-disk-type=pd-standard \
-        --boot-disk-auto-delete \
-        --metadata-from-file=user-data="${USER_DATA_FILE}" \
-        --metadata=serial-port-enable=true \
-        --confidential-compute \
-        --maintenance-policy=TERMINATE \
-        --shielded-secure-boot \
-        --shielded-vtpm \
-        --shielded-integrity-monitoring \
-        "$@"
-fi
+# Launch instance with all required settings. No service account / scopes: stage0..stage2 never
+# call GCP APIs, so the guest gets no metadata-server credentials to leak.
+${GCLOUD} compute instances create "${INSTANCE_NAME}" \
+    --project="${PROJECT}" \
+    --zone="${ZONE}" \
+    --machine-type="${MACHINE_TYPE}" \
+    --image="${IMAGE}" \
+    --network-interface=nic-type=GVNIC \
+    --boot-disk-type=pd-standard \
+    --boot-disk-auto-delete \
+    --metadata-from-file=user-data="${USER_DATA_FILE}" \
+    --metadata=serial-port-enable=true \
+    "${CONF_ARGS[@]}" \
+    --maintenance-policy=TERMINATE \
+    --shielded-secure-boot \
+    --shielded-vtpm \
+    --shielded-integrity-monitoring \
+    --no-service-account --no-scopes \
+    "$@"
+if [ -n "${MANIFEST}" ]; then printf '%s\n' "gcp instance ${PROJECT} ${ZONE}/${INSTANCE_NAME}" >> "${MANIFEST}"; fi
 
 echo ""
 echo "=== Instance Created Successfully ==="
