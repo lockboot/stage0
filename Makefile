@@ -128,8 +128,11 @@ build/%/stage0.efi: build/%/ena.efi build/%/gvnic.efi docker-build-base
 		bash -c "mkdir -p build/$* && rustup target add $*-unknown-uefi && cargo build --release --manifest-path $(STAGE0_DIR)/Cargo.toml --target $*-unknown-uefi $(if $(STAGE0_FEATURES),--features $(STAGE0_FEATURES)) && cp -v $(STAGE0_DIR)/target/$*-unknown-uefi/release/stage0.efi $@"
 
 # ---- Assemble + db-sign the boot disk (privileged: losetup/mount) ----
+# os-release carries a yy.mm version: the committer date (UTC) of the commit being built, not the
+# build date. Read here because the build image has no git.
+COMMIT_YEAR_MONTH := $(shell TZ=UTC git log -1 --format=%cd --date=format-local:%y.%m)
 build/%/boot.disk: build/%/stage0.efi build/keys/db.crt
-	$(DOCKER_RUN) -e ARCH=$* $(BUILD_IMAGE) ./tools/build.sh
+	$(DOCKER_RUN) -e ARCH=$* -e COMMIT_YEAR_MONTH=$(COMMIT_YEAR_MONTH) $(BUILD_IMAGE) ./tools/build.sh
 
 build-amd64 build-x86_64:  build/x86_64/boot.disk
 build-arm64 build-aarch64: build/aarch64/boot.disk
