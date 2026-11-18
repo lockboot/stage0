@@ -13,7 +13,9 @@
 #               (The embedded NIC drivers and the payload are loaded through stage0's own
 #               Security2 override, which bypasses the firmware's image measurement: the
 #               drivers are covered by stage0's own hash, the payload by PCR14.)
-#   PCR5        EV_SEPARATOR, EV_EFI_GPT_EVENT = UEFI_GPT_DATA of boot.disk.
+#   PCR5        EV_SEPARATOR, EV_EFI_GPT_EVENT = UEFI_GPT_DATA of boot.disk. That is the GPT a
+#               first boot measures; stage2 rewrites it, so the event is marked
+#               "from_attestation": "gpt" and a replay takes the attestation's GPT digests.
 #   PCR7        SecureBoot, PK, KEK, db, dbx (EV_EFI_VARIABLE_DRIVER_CONFIG, the enrolled ESLs),
 #               EV_SEPARATOR, EV_EFI_VARIABLE_AUTHORITY = the db entry that verified stage0.
 #               The ESLs are rebuilt with mkvarstore.py's own code; on GCP they are
@@ -30,7 +32,7 @@
 # updates: a per-platform replay file (golden readings) supplies them.
 #
 # Also writes pcrs.json (vaportpm layout): replaying this file alone, i.e. every PCR it models
-# except the payload-dependent PCR14 -- the reference a verifier compares a quote against.
+# except the payload-dependent PCR14, with boot.disk's GPT (a first boot's PCR5).
 #
 # usage: predict-pcrs.py <build-dir> [--banks sha256,sha384] --replay F [--out pcrs.json]
 from __future__ import annotations
@@ -179,6 +181,8 @@ def replay_file(d: str, banks: list[str]) -> dict[str, Any]:
             e["digest"] = mode
         e["digests"] = {b: (authenticode(data, getattr(hashlib, b)) if mode == "authenticode"
                             else getattr(hashlib, b)(data).digest()).hex() for b in banks}
+        if typ == "EV_EFI_GPT_EVENT":
+            e["from_attestation"] = "gpt"
         events.append(e)
     events.append({"pcr": 14, "type": "unlogged", "by": "stage0",
                    "about": "the payload stage0 verified and runs: H_bank(sha256(payload))",

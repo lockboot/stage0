@@ -112,7 +112,8 @@ echo "EFI vars written: ${EFI_VARS_OVMF}"
 # Emit os-release so the cloud publishers can name/tag the image. BUILD_ID is
 # derived from the signed stage0 hash so each build is traceable.
 OSREL_PATH="${OUTPUT_DIR}/os-release"
-YEAR_MONTH=$(date +%y.%m)
+# yy.mm of the commit being built (from the Makefile), never the build date.
+YEAR_MONTH="${COMMIT_YEAR_MONTH:?set COMMIT_YEAR_MONTH (yy.mm of the commit being built; the Makefile does)}"
 {
   echo "ID=lockboot"
   echo "VERSION_ID=${YEAR_MONTH}"

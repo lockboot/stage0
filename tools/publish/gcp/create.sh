@@ -126,8 +126,12 @@ if [ "${VERSION}" != "local" ]; then
         echo "Repository: ${GH_REPO}; fetching stage0-${ARCH}.zip @ ${VERSION}"
         gh release download "${VERSION}" --repo "${GH_REPO}" --pattern "stage0-${ARCH}.zip" --dir "${TEMP_DIR}" \
             || die "failed to download stage0-${ARCH}.zip from release ${VERSION}"
-        gh attestation verify "${ZIP}" --repo "${GH_REPO}" \
-            || die "attestation verification failed for stage0-${ARCH}.zip"
+        # The provenance must come from a build of this release's tag (only admins create v*
+        # tags, and none can be moved), and the zip must be the asset of the immutable release.
+        gh attestation verify "${ZIP}" --repo "${GH_REPO}" --source-ref "refs/tags/${VERSION}" \
+            || die "attestation verification failed for stage0-${ARCH}.zip (built from refs/tags/${VERSION}?)"
+        gh release verify-asset "${VERSION}" "${ZIP}" --repo "${GH_REPO}" \
+            || die "stage0-${ARCH}.zip is not an asset of the immutable release ${VERSION}"
     fi
     unzip -q "${ZIP}" -d "${TEMP_DIR}"
     WORK_DIR="${TEMP_DIR}"
@@ -160,9 +164,19 @@ if [ "${DEFAULT_DBX}" != "true" ]; then
     [ -f "${DBX_FILE}" ] || die "dbx.auth.bin not found: ${DBX_FILE} (rebuild: make build-${ARCH})"
 fi
 
-# os-release provides ID, VERSION_ID, BUILD_ID, NAME, PRETTY_NAME (our own artifact).
-# shellcheck disable=SC1090
-source "${OS_RELEASE_FILE}"
+# os-release provides ID, VERSION_ID, BUILD_ID, NAME, PRETTY_NAME. Read as data, never sourced:
+# under --no-verify it is unverified downloaded content.
+os_release() {  # KEY -> its value, surrounding double quotes removed
+    local v
+    v=$(grep -m1 "^$1=" "${OS_RELEASE_FILE}") || die "os-release: no $1 in ${OS_RELEASE_FILE}"
+    v="${v#*=}"; v="${v%\"}"; v="${v#\"}"
+    printf '%s' "$v"
+}
+ID=$(os_release ID)
+VERSION_ID=$(os_release VERSION_ID)
+BUILD_ID=$(os_release BUILD_ID)
+NAME=$(os_release NAME)
+PRETTY_NAME=$(os_release PRETTY_NAME)
 
 VERSION_DASH=$(echo "${VERSION_ID}" | tr '.' '-')
 ARCH_DASH=$(echo "${ARCH}" | tr '_' '-')
